@@ -49,8 +49,6 @@ type providerJSON struct {
 	KeysURL   string            `json:"keysUrl"`
 	Headers   map[string]string `json:"headers,omitempty"`
 
-	AccountOrder []string `json:"accountOrder,omitempty"`
-
 	// where a custom provider's balance is asked (see provider.Balance)
 	BalanceURL  string `json:"balanceURL,omitempty"`
 	BalancePath string `json:"balancePath,omitempty"`
@@ -201,7 +199,7 @@ func providerInfo(p provider.Provider, agents []agentUse) providerJSON {
 		Catalog: p.Catalog, Website: p.Website, KeysURL: p.KeysURL,
 		Headers: p.Headers, BalanceURL: p.BalanceURL, BalancePath: p.BalancePath, ModelsURL: p.ModelsURL,
 		Ready: p.Ready(), Chosen: p.Models, Models: []modelJSON{}, Agents: []providerAgent{},
-		AccountOrder: p.AccountOrder, Fallback: p.Fallback, Routing: p.Routing, Affinity: p.Affinity, Unlisted: p.Unlisted, Off: p.Off, Contexts: p.Contexts,
+		Fallback: p.Fallback, Routing: p.Routing, Affinity: p.Affinity, Unlisted: p.Unlisted, Off: p.Off, Contexts: p.Contexts,
 	}
 	if out.Fallback == nil {
 		out.Fallback = []string{}
@@ -439,6 +437,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 	mux.HandleFunc("POST /api/provider/{action}", func(rw http.ResponseWriter, r *http.Request) {
 		var req struct {
 			provider.Provider
+			AccountOrder []string `json:"accountOrder"`
 			// New is set by the editor's Add: the provider is one more, never
 			// one replacing the provider that has its id or name
 			New bool `json:"new"`
@@ -526,7 +525,6 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				if old != nil {
 					// the other keys are kept apart, in the Accounts list
 					in.Keys = old.Keys
-					in.AccountOrder = old.AccountOrder
 					in.Routing = old.Routing // set on its own, with route
 					in.Off = old.Off         // and this with off and on
 					if in.Contexts == nil {
@@ -580,12 +578,15 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				return
 			}
 		case "arrange":
-			if err := provider.SetAccountOrder(in.ID, in.AccountOrder); err != nil {
+			// Promoting the first row is the same account switch as Make first:
+			// keep the agents' catalogs in sync with the new primary sign-in.
+			var err error
+			moved, err = agent.Reseat(func() error { return provider.SetAccountOrder(in.ID, req.AccountOrder) })
+			if err != nil {
 				fail(rw, err)
 				return
 			}
-			writeJSON(rw, map[string]any{"accountOrder": in.AccountOrder})
-			return
+			agent.SyncCatalog()
 		case "route":
 			if err := provider.SetRouting(in.ID, in.Routing); err != nil {
 				fail(rw, err)

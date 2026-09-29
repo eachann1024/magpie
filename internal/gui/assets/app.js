@@ -4179,13 +4179,9 @@ function renderSigning(sub) {
   return box;
 }
 
-// Display arrangement is independent of which account is signed in or preferred.
-// API calls share the existing provider store, not a browser-local preference.
+// The backend returns the native key/login order and the new First account.
+// Do not keep a second display order that can disagree with routing.
 let accountArranging = false, accountSaving = false, accountRenderPending = false;
-function orderedAccounts(items, order, id) {
-  const rank = new Map((order || []).map((v, i) => [v, i]));
-  return [...items].sort((a, b) => (rank.get(id(a)) ?? rank.size) - (rank.get(id(b)) ?? rank.size));
-}
 function accountArrangementDone() {
   accountArranging = false;
   if (accountRenderPending) { accountRenderPending = false; renderProviders(); }
@@ -4200,22 +4196,21 @@ function arrangeAccountRows(list, p) {
     if (accountSaving || to < 0 || to >= current.length || to === from) return;
     accountSaving = accountArranging = true;
     list.setAttribute("aria-busy", "true");
-    const before = p.accountOrder;
+    const before = [...list.children];
     const focus = document.activeElement === row;
     list.insertBefore(row, to > from ? current[to].nextSibling : current[to]);
     current.splice(to, 0, ...current.splice(from, 1));
     if (focus) row.focus({ preventScroll: true });
     const order = current.map((r) => r.dataset.accountId);
-    p.accountOrder = order;
     try {
-      await api("provider/arrange", { id: p.id, accountOrder: order });
-      const latest = providers?.providers.find((q) => q.id === p.id);
-      if (latest) latest.accountOrder = order;
+      providers = await api("provider/arrange", { id: p.id, accountOrder: order });
+      accountRenderPending = true;
       status(t("Account order saved"), "ok");
     } catch (e) {
-      p.accountOrder = before;
-      const latest = providers?.providers.find((q) => q.id === p.id);
-      if (latest) latest.accountOrder = before;
+      list.replaceChildren(...before);
+      // A failed account switch can still have refreshed the agent's sign-in.
+      // Reconcile with the backend rather than claiming a local rollback undid it.
+      try { providers = await api("providers"); } catch (_) { /* keep the last known list */ }
       accountRenderPending = true;
       status(e.message, "err");
     } finally {
@@ -4258,7 +4253,6 @@ function renderAccounts(a, p) {
   const list = el("div", "accts");
   let ls = a.logins?.length ? [...a.logins] : [{ user: a.user, plan: a.plan, active: true, on: true }];
   ls.sort((x, y) => (y.active ? 1 : 0) - (x.active ? 1 : 0));
-  ls = orderedAccounts(ls, p.accountOrder, (l) => l.user);
   const several = ls.filter((l) => l.active || l.on).length > 1;
   const quota = loginUsageOf(a.agent);
   for (const l of ls) {
@@ -4660,7 +4654,7 @@ let addingKey = null;
 function renderKeyAccounts(p) {
   const list = el("div", "accts");
   const several = p.keyList.filter((k) => k.on).length > 1;
-  for (const k of orderedAccounts(p.keyList, p.accountOrder, (k) => k.id)) {
+  for (const k of p.keyList) {
     const row = el("div", "acc" + (k.on ? " in-use" : " off") + (k.id === justAdded ? " new" : ""));
     row.dataset.accountId = k.id;
     // the dot is the switch: every key ticked is in use

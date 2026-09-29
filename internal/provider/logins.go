@@ -38,6 +38,9 @@ type Login struct {
 }
 
 type savedLogin struct {
+	// Order is the user-arranged routing order within this agent. Zero keeps
+	// the original alphabetical order for accounts not arranged yet.
+	Order int       `json:"order,omitempty"`
 	Agent string    `json:"agent"`
 	User  string    `json:"user"`
 	Plan  string    `json:"plan,omitempty"`
@@ -93,6 +96,15 @@ func writeLogins(ls []savedLogin) error {
 		if ls[i].Agent != ls[j].Agent {
 			return ls[i].Agent < ls[j].Agent
 		}
+		if ls[i].Order != ls[j].Order {
+			if ls[i].Order == 0 {
+				return false
+			}
+			if ls[j].Order == 0 {
+				return true
+			}
+			return ls[i].Order < ls[j].Order
+		}
 		return strings.ToLower(ls[i].User) < strings.ToLower(ls[j].User)
 	})
 	b, err := json.MarshalIndent(ls, "", "  ")
@@ -131,6 +143,7 @@ func upsertLogin(ls []savedLogin, l savedLogin) []savedLogin {
 	for i := range ls {
 		if sameLogin(ls[i], l) {
 			l.On = l.On || ls[i].On
+			l.Order = ls[i].Order
 			ls[i] = l
 			return ls
 		}
@@ -169,6 +182,10 @@ func dedupeLogins(ls []savedLogin) []savedLogin {
 		}
 		keep.On = previous.On || l.On
 		keep.First = previous.First || l.First
+		keep.Order = previous.Order
+		if keep.Order == 0 {
+			keep.Order = l.Order
+		}
 		out[found] = keep
 	}
 	return out

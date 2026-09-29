@@ -79,10 +79,6 @@ type Provider struct {
 	// failing is passed over for as long as that lasts.
 	Routing string `json:"routing,omitempty"`
 
-	// AccountOrder is the display order of account names or key fingerprints.
-	// Moving a row does not switch credentials or change routing policy.
-	AccountOrder []string `json:"accountOrder,omitempty"`
-
 	// Affinity is how long a conversation stays with the key or account
 	// that answered it, so the vendor's prompt cache it filled is read
 	// again rather than lost (see Affinities): "" auto, "session",
@@ -220,7 +216,6 @@ func All() []Provider {
 		}
 		pk := picks[a.ID]
 		a.Models, a.Unlisted, a.Off, a.Fallback, a.Routing, a.Affinity, a.Contexts, a.Family = pk.Models, pk.Unlisted, pk.Off, pk.Fallback, pk.Routing, pk.Affinity, pk.Contexts, pk.Family
-		a.AccountOrder = pk.AccountOrder
 		if a.ID == "cursor" { // picked before its efforts were one model
 			a.Models = cursorPicks(a.Models)
 		}
@@ -313,7 +308,7 @@ func Save(p Provider) error {
 		if p.ID == "kiro" {
 			key = p.Key
 		}
-		p = Provider{ID: p.ID, Key: key, Models: p.Models, Unlisted: p.Unlisted, Off: p.Off, Fallback: p.Fallback, Routing: p.Routing, AccountOrder: p.AccountOrder, Affinity: p.Affinity, Contexts: p.Contexts, Family: p.Family, Hidden: hiddenAccount(p.ID), Quiet: quietAccount(p.ID)}
+		p = Provider{ID: p.ID, Key: key, Models: p.Models, Unlisted: p.Unlisted, Off: p.Off, Fallback: p.Fallback, Routing: p.Routing, Affinity: p.Affinity, Contexts: p.Contexts, Family: p.Family, Hidden: hiddenAccount(p.ID), Quiet: quietAccount(p.ID)}
 	} else {
 		if slices.Contains(accountIDs, p.ID) && !stored(p.ID) {
 			// taken, it would hide that subscription once signed in

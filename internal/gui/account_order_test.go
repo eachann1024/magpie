@@ -32,20 +32,28 @@ func TestAccountArrangeRouteAndEditorSave(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("%d %s", w.Code, w.Body)
 	}
-	if strings.Contains(w.Body.String(), "primary") || strings.Contains(w.Body.String(), "second") {
+	var state providersJSON
+	if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Providers) == 0 || state.Providers[0].KeyList[0].ID != order[0] || !state.Providers[0].KeyList[0].Active {
+		t.Fatal("arrange response must include the new First key")
+	}
+	if strings.Contains(w.Body.String(), `"key":"primary"`) || strings.Contains(w.Body.String(), `"key":"second"`) {
 		t.Fatal("leaked key")
 	}
-	// Saving an older editor form must not erase the separate arrangement.
+	// Saving an older editor form must not erase the native key arrangement.
 	w = post("save", map[string]any{"id": p.ID, "name": p.Name, "chat": p.Chat})
 	if w.Code != 200 {
 		t.Fatalf("%d %s", w.Code, w.Body)
 	}
 	got, err := provider.Find(p.ID)
-	if err != nil || !reflect.DeepEqual(got.AccountOrder, order) {
+	if err != nil || !reflect.DeepEqual([]string{provider.KeyID(got.Key), provider.KeyID(got.Keys[0].Key)}, order) {
 		t.Fatalf("lost order: %v", err)
 	}
-	if !reflect.DeepEqual(providerInfo(*got, nil).AccountOrder, order) {
-		t.Fatal("not returned to UI")
+	info := providerInfo(*got, nil)
+	if info.KeyList[0].ID != order[0] || !info.KeyList[0].Active {
+		t.Fatal("displayed first key does not match routing")
 	}
 	if w = post("arrange", map[string]any{"id": p.ID, "accountOrder": []string{"missing"}}); w.Code == 200 {
 		t.Fatal("accepted stale order")
