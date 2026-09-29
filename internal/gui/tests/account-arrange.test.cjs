@@ -108,8 +108,15 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     for (const id of ["antigravity", "relay"]) {
       await open(page, id);
       for (const [mode, label] of [["", "Smart"], ["order", "In order"], ["rotate", "In turn"], ["usage", "Least used first"]]) {
+        // Smart may already be selected. The old routing value alone says
+        // nothing about whether its POST has finished redrawing the editor.
+        const oldFirst = await rows(page).first().elementHandle();
+        const routeResponse = page.waitForResponse(response =>
+          new URL(response.url()).pathname === "/api/provider/route" && response.request().method() === "POST");
         await page.locator(".editor .segs button", { hasText: new RegExp(`^${label}$`) }).click();
-        await page.waitForFunction(({ id, mode }) => providers.providers.find(p => p.id === id).routing === mode, { id, mode });
+        assert.equal((await routeResponse).status(), 200);
+        await page.waitForFunction(row => !row.isConnected, oldFirst);
+        assert.equal(f.providers.providers.find(p => p.id === id).routing, mode);
         const before = await ids(page), count = f.posted.filter(p => p.action === "/api/provider/arrange").length;
         await drag(page);
         assert.deepEqual(await ids(page), [before[1], before[0], ...before.slice(2)]);
