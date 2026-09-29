@@ -4236,6 +4236,8 @@ function arrangeAccountRows(list, p) {
     };
     row.onpointerdown = (e) => {
       if (accountArranging || e.target.closest("input, textarea, select, a, [contenteditable=true], button:not(.rename)")) return;
+      // Text selection is native; drag the row's background/empty space instead.
+      if (e.target.closest(".n:not(button), .plan, .aq")) return;
       const current = [...list.children].filter((r) => r.dataset.accountId);
       accountArranging = dragRows(e, row, row, list, current, (to) => move(row, to), () => {},
         () => { if (!accountSaving) accountArrangementDone(); });
