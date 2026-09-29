@@ -237,6 +237,9 @@ function renderAgents() {
       b.onclick = (ev) => openPicker(a, f, b, ev);
       fields.append(b);
     }
+    // an agent that takes the gateway only from its environment (agy): a
+    // square that copies the command starting it on magpie
+    if (a.launch) extras.append(launchButton(a));
     if (extras.childNodes.length) fields.append(extras);
     // an app that takes magpie by a link of its own (Cindy) has nothing to
     // pick: its row opens the link, and the app asks to add magpie
@@ -351,9 +354,9 @@ function renderAgents() {
   };
   // the extras column is there for every row once any agent has one, so the
   // pickers keep lining up down the list
-  list.classList.toggle("extras", state.agents.some((a) => a.fields.some(extra) || tierMenu(a)));
+  list.classList.toggle("extras", state.agents.some((a) => a.fields.some(extra) || tierMenu(a) || a.launch));
   // as wide as the row with the most squares
-  list.style.setProperty("--extras", Math.max(1, ...state.agents.map((a) => a.fields.filter((f) => extra(f) && !TIERS.includes(f.label)).length + (tierMenu(a) ? 1 : 0))));
+  list.style.setProperty("--extras", Math.max(1, ...state.agents.map((a) => a.fields.filter((f) => extra(f) && !TIERS.includes(f.label)).length + (tierMenu(a) ? 1 : 0) + (a.launch ? 1 : 0))));
   if (!folded.length) {
     for (const a of used) list.append(agentRow(a));
   } else {
@@ -426,11 +429,22 @@ function renderAgents() {
     list.append(more, fold);
   }
 
+  renderProfiles();
+  fit(0, agentsGlide);
+  agentsGlide = null;
+}
+
+// renderProfiles draws the saved profiles as chips, a chip whose save,
+// update or use is on its way dimmed until the answer is in.
+function renderProfiles() {
   const chips = $("#profiles");
   chips.replaceChildren();
+  $(".profiles > .chip-input")?.remove(); // a name field open goes with the list it was for
+  $("#save").textContent = t("＋ Save current");
   if (!state.profiles.length) chips.append(el("span", "hint", t("none yet · save the setup to switch back in one click")));
   for (const p of state.profiles) {
     const c = el("button", "chip");
+    if (profilePending.has(p.name)) c.classList.add("pending");
     const lib = profileLibrary(p.library);
     c.title = [p.summary, lib].filter(Boolean).join("\n");
     c.append(el("span", "", p.name));
@@ -446,8 +460,6 @@ function renderAgents() {
     c.onclick = () => profileAction("use", p.name);
     chips.append(c);
   }
-  fit(0, agentsGlide);
-  agentsGlide = null;
 }
 
 // driftNote: under the name of an agent whose config something else
@@ -904,6 +916,22 @@ function extraField(a, f) {
   return b;
 }
 
+// launchButton copies the command that starts an agent on magpie, for one
+// that takes the gateway only from its environment (agy)
+function launchButton(a) {
+  const b = el("button", "field extra launch");
+  b.type = "button";
+  b.append(svg(LAUNCH_GLYPH, 13, 1.5));
+  b.title = t("{name} takes magpie only from its environment · click to copy the command that starts it:", { name: a.name }) + "\n" + a.launch;
+  b.setAttribute("aria-label", b.title);
+  b.onclick = (ev) => {
+    ev.stopPropagation();
+    copy(a.launch, t("Launch command"), null, t("Copied — run it to start {name} on magpie", { name: a.name }));
+  };
+  return b;
+}
+const LAUNCH_GLYPH = "M2.5 3.5h11v9h-11zM5 6.5l2 1.75L5 10M8.5 10h2.5";
+
 function tierMenu(a) {
   const tiers = a.fields.filter((f) => TIERS.includes(f.label));
   if (!tiers.length || !tiers.some((f) => f.options.length)) return null;
@@ -977,7 +1005,7 @@ function fit(extra = 0, glide) {
   const body = document.body, tab = body.dataset.ptab;
   delete body.dataset.ptab;
   // extra is only ever the agents' (a row opening, the scroll unrolling)
-  const tallest = Math.max($("#agents").offsetHeight + extra, $(".profiles").offsetHeight, $("#panelQuota").offsetHeight);
+  const tallest = Math.max($("#agents").offsetHeight + extra, $(".profiles").offsetHeight, $("#panelQuota").offsetHeight, $("#panelRouting").offsetHeight);
   if (tab) body.dataset.ptab = tab;
   const h = $(".top").offsetHeight + $("#ptabs").offsetHeight + tallest + $(".foot").offsetHeight + 4;
   if (h === fit.last) return;
@@ -1601,9 +1629,26 @@ function profileLibrary(l) {
   return parts.length ? t("+ Library: {what}", { what: parts.join(t(", ")) }) : t("+ Library: nothing on");
 }
 
+// profilePending are the profiles a save, update, delete or use is on its
+// way for. What the click does shows at once — the chip saved is there, the
+// one deleted gone, the name field closed — rather than when magpie has read
+// every agent again for the answer: that took seconds, and a Save or × that
+// changed nothing for that long looked broken. An error puts the list back.
+const profilePending = new Set();
+
 async function profileAction(action, name, update) {
+  const before = state.profiles;
+  if (action === "delete") state.profiles = before.filter((p) => p.name !== name);
+  else if (action === "save" && !before.some((p) => p.name === name)) {
+    // where magpie will list it: by name, as Go's sort.Strings has them
+    state.profiles = [...before, { name, summary: "" }].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  }
+  if (action !== "delete") profilePending.add(name);
+  renderProfiles();
+  fit();
   try {
     const data = await api("profile/" + action, { name });
+    profilePending.delete(name);
     state = data;
     renderAgents();
     if (action === "use") {
@@ -1616,23 +1661,44 @@ async function profileAction(action, name, update) {
     else if (action === "save") status(t(update ? "Updated {name} to the current setup" : "Saved {name}", { name }), "ok");
     else status(t("Deleted {name}", { name }));
   } catch (e) {
+    profilePending.delete(name);
+    state.profiles = before;
+    renderProfiles();
+    fit();
     status(e.message, "err");
   }
 }
 
-$("#save").onclick = () => {
-  const chips = $("#profiles");
-  if (chips.querySelector(".chip-input")) return;
+// ＋ Save current opens a name field beside it, and the button is Save; a
+// click on it saves as Enter does (it did nothing: the field lost focus to
+// it and went). The field goes where the button is, not at the head of the
+// list: in the panel it drew the list up under the tabs, the field's top
+// cut off, or put the button out of sight below it.
+const saveCurrent = $("#save");
+const saveField = () => $(".profiles > .chip-input");
+const closeSave = (input) => {
+  input.remove();
+  if (!saveField()) saveCurrent.textContent = t("＋ Save current");
+};
+saveCurrent.onmousedown = (e) => { if (saveField()) e.preventDefault(); }; // the field keeps focus
+saveCurrent.onclick = () => {
+  const open = saveField();
+  if (open) {
+    if (open.value.trim()) profileAction("save", open.value.trim());
+    else open.focus({ preventScroll: true });
+    return;
+  }
   const input = el("input", "chip-input");
   input.placeholder = t("Profile name");
   input.onkeydown = (e) => {
     if (e.key === "Enter" && input.value.trim()) profileAction("save", input.value.trim());
-    else if (e.key === "Escape") input.remove();
+    else if (e.key === "Escape") closeSave(input);
     e.stopPropagation();
   };
-  input.onblur = () => setTimeout(() => input.remove(), 100);
-  chips.prepend(input);
-  input.focus();
+  input.onblur = () => setTimeout(() => closeSave(input), 100);
+  saveCurrent.before(input);
+  saveCurrent.textContent = t("Save");
+  input.focus({ preventScroll: true });
 };
 
 // ---------- providers view ----------
@@ -3786,7 +3852,14 @@ function renderRouting(p) {
     const r = ROUTINGS.find(([id]) => id === routing);
     accountAction("provider/route", { id: p.id, routing }, t("{name}: {routing}", { name: p.name, routing: t(r[1]) }));
   });
-  return field(t("Routing"), pick, t(cur[2]));
+  // what Codex or Claude Code sends past magpie goes to the account it is
+  // signed in to, which magpie moves on once Smart would count it spent
+  // (provider.KeepOnAnAccountWithRoom, #209)
+  const a = p.account;
+  const own = a && (a.agent === "codex" || a.agent === "claude")
+    ? " " + t("Routing picks the account for each request through magpie; {agent} on its own uses the one it is signed in to, which magpie moves to the next ticked account with room once it is 98% used.", { agent: a.agentName })
+    : "";
+  return field(t("Routing"), pick, t(cur[2]) + own);
 }
 
 // renderFallback: where requests go when this provider can't take them —
@@ -3858,8 +3931,9 @@ function fallbackHint(p) {
 // being the one in use.
 
 const SUBS = [
-  { agent: "claude", name: "Claude", icon: "claude-color", plans: "Pro · Max · Team" },
-  { agent: "codex", name: "ChatGPT", icon: "openai", plans: "Plus · Pro · Business" },
+  // both can also come from CLIProxyAPI's auth files or the agent's own (importing below)
+  { agent: "claude", name: "Claude", icon: "claude-color", plans: "Pro · Max · Team", importable: true },
+  { agent: "codex", name: "ChatGPT", icon: "openai", plans: "Plus · Pro · Business", importable: true },
   // cursor-agent keeps one account; signing in again replaces it
   { agent: "cursor", name: "Cursor", icon: "cursor", plans: "Pro · Ultra · Teams", single: true },
   // so does Grok Build
@@ -3886,6 +3960,29 @@ const SUBS = [
   { agent: "antigravity", name: "Antigravity", icon: "antigravity-color", plans: "Google AI Pro · Ultra · free", risk: true, importable: true },
 ];
 const subOf = (agent) => SUBS.find((x) => x.agent === agent);
+
+// importSay: what the import of an app's accounts says — where its files
+// come from, and who they are checked with. A ChatGPT or Claude sign-in is
+// refreshed as it comes in, which spends the file's refresh token.
+function importSay(agent) {
+  if (agent === "codex" || agent === "claude") {
+    const vendor = agent === "codex" ? "ChatGPT" : "Claude";
+    const own = agent === "codex" ? "Codex's auth.json" : "Claude Code's .credentials.json";
+    return {
+      from: t("Bring in accounts from CLIProxyAPI's auth files or {own}", { own }),
+      intro: t("Choose or paste CLIProxyAPI's auth files (JSON) or {own}. Each account's sign-in is refreshed with {vendor} before it is added.", { own, vendor }),
+      spent: t("Refreshing it spends the file's sign-in: the tool it came from will need to sign in again to use that account."),
+      checking: t("Checking the accounts with {vendor}…", { vendor }),
+      checks: t("Each account's sign-in is refreshed and its account looked up, as signing in does."),
+    };
+  }
+  return {
+    from: t("Bring in accounts exported from Antigravity Cockpit, Antigravity Manager or CLIProxyAPI"),
+    intro: t("Choose or paste an export from Antigravity Cockpit, Antigravity Manager or CLIProxyAPI — JSON, or refresh tokens one a line. Each account is checked with Google before it is added."),
+    checking: t("Checking the accounts with Google…"),
+    checks: t("Each account's sign-in is refreshed and its project looked up, as signing in does."),
+  };
+}
 let signing = null; // the sign-in under way: { id, agent, url, state, installing, error }
 const signingOpen = () => signing?.state === "waiting" || signing?.state === "installing";
 let justAdded = ""; // the account that just came in, to greet it
@@ -4023,13 +4120,13 @@ function renderSigning(sub) {
     close.onclick = cancelSignIn;
     if (sub.importable) {
       const imp = el("button", "text", t("Import instead…"));
-      imp.title = t("Bring in accounts exported from Antigravity Cockpit, Antigravity Manager or CLIProxyAPI");
+      imp.title = importSay(sub.agent).from;
       imp.onclick = () => startImport(sub.agent);
       box.append(close, imp, go);
     } else box.append(close, go);
     return box;
   }
-  if (signing.state === "import" || signing.state === "importing" || signing.state === "imported") return renderImport(sub);
+  if (signing.state === "import" || signing.state === "importing" || signing.state === "imported") return renderLoginImport(sub);
   if (signing.state === "failed") {
     box.append(el("span", "mark", "!"));
     tt.append(el("span", "n", t("Sign-in didn't finish")), el("span", "s", signing.error || ""));
@@ -4067,6 +4164,14 @@ function renderSigning(sub) {
     cp.onclick = () => copy(signing.url, t("Sign-in link"), cp);
     acts.append(open, cp);
     tt.append(acts);
+  }
+  if (sub.importable) {
+    // an account another tool is signed in to comes in from its file
+    const imp = el("button", "link", t("Import from a file instead…"));
+    imp.title = importSay(sub.agent).from;
+    imp.onclick = () => startImport(sub.agent);
+    const acts = tt.querySelector(".acts") || tt.appendChild(el("span", "acts"));
+    acts.append(imp);
   }
   const x = el("button", "text", t("Cancel"));
   x.onclick = cancelSignIn;
@@ -4203,7 +4308,7 @@ function renderAccounts(a, p) {
       const ic2 = el("span", "dot");
       ic2.append(svg(PLUS, 10, 1.8));
       imp.append(ic2, el("span", "n", t("Import accounts from a file…")));
-      imp.title = t("Bring in accounts exported from Antigravity Cockpit, Antigravity Manager or CLIProxyAPI");
+      imp.title = importSay(a.agent).from;
       imp.onclick = () => startImport(a.agent);
       list.append(imp);
     }
@@ -4276,13 +4381,13 @@ async function runImport(agent) {
 
 const importStatus = { added: "Added", updated: "Updated with this sign-in", exists: "Already in magpie", failed: "Not added" };
 
-function renderImport(sub) {
+function renderLoginImport(sub) {
   const box = el("div", "signing import");
   const tt = el("span", "tt");
   if (signing.state === "importing") {
     box.append(el("span", "spinner"));
-    tt.append(el("span", "n", t("Checking the accounts with Google…")),
-      el("span", "s", t("Each account's sign-in is refreshed and its project looked up, as signing in does.")));
+    const say = importSay(sub.agent);
+    tt.append(el("span", "n", say.checking), el("span", "s", say.checks));
     box.append(tt);
     return box;
   }
@@ -4304,8 +4409,9 @@ function renderImport(sub) {
     return box;
   }
   box.append(el("span", "mark", "↑"));
-  tt.append(el("span", "n", t("Import {name} accounts", { name: sub.name })),
-    el("span", "s", t("Choose or paste an export from Antigravity Cockpit, Antigravity Manager or CLIProxyAPI — JSON, or refresh tokens one a line. Each account is checked with Google before it is added.")));
+  const say = importSay(sub.agent);
+  tt.append(el("span", "n", t("Import {name} accounts", { name: sub.name })), el("span", "s", say.intro));
+  if (say.spent) tt.append(el("span", "s", say.spent));
   if (sub.risk) tt.append(el("span", "s", t("Google may suspend an Antigravity account it sees used outside Antigravity. Use one you can afford to lose.")));
   const area = el("textarea");
   area.rows = 3;
@@ -4966,11 +5072,25 @@ function fmtN(n) {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
   return String(n);
 }
+// currency is Settings' choice of what a cost shows as: usd (its own price)
+// or cny, converted with fx (the rate this session last got from magpie,
+// with when that was and whether it's stale — kept only for the tooltip;
+// see applyPrefs, which fills both from what /api/settings answers).
+let currency = "usd";
+let fx = { rate: 0, at: null, stale: true };
 function fmtCost(t) {
   if (!t.cost && t.unpriced) return "";
-  const c = t.cost;
+  let c = t.cost, sign = "$";
+  if (currency === "cny" && fx.rate > 0) { c = c * fx.rate; sign = "¥"; }
   const s = c >= 100 ? c.toFixed(0) : c >= 1 ? c.toFixed(2) : c.toFixed(3);
-  return "$" + s + (t.unpriced ? "+" : "");
+  return sign + s + (t.unpriced ? "+" : "");
+}
+// renderCosts redraws whatever on the Usage page shows a cost, once the
+// currency changes — the numbers alone, not the page around them, so a
+// click on the setting never moves anything it isn't showing (#212)
+function renderCosts() {
+  if (usage) renderUsage();
+  if (sessions) renderSessions();
 }
 const tokensOf = (t) => t.input + t.output;
 
@@ -5056,8 +5176,10 @@ function planSpan(q) {
   return s;
 }
 
-// The tray panel is three tabs over the one page: the agents, the usage of
-// every subscription and key, and the saved profiles. The tab is remembered.
+// The tray panel is four tabs over the one page: the agents, the allowances
+// of every subscription and key (the "usage" tab, as it was named before),
+// the gateway's latest requests (routing.js draws those) and the saved
+// profiles. The tab is remembered.
 let panelTab = "agents";
 try { panelTab = localStorage.getItem("magpie.panelTab") || "agents"; } catch {}
 function setPanelTab(tab) {
@@ -5074,6 +5196,7 @@ function setPanelTab(tab) {
   // the card under the tab picked glides to it, as on every other pill
   slide(tabs, "ptabs");
   panelAge();
+  window.panelRoutingShown?.();
   fit();
 }
 if (mode === "panel") {
@@ -5945,6 +6068,7 @@ $("#sessQ").onkeydown = (e) => { if (e.key === "Escape" && e.target.value) { e.s
 const THEMES = [["system", "System"], ["light", "Light"], ["dark", "Dark"]];
 const LOCALES = [["system", "System"], ["en", "English"], ["zh", "中文"]];
 const TRAYS = [["panel", "Quick panel"], ["window", "Main window"]];
+const CURRENCIES = [["usd", "$ USD"], ["cny", "¥ CNY"]];
 
 // applyPrefs paints and speaks as the saved settings say. A ?theme= or
 // ?locale= in the URL wins, so a forced look stays forced.
@@ -5971,6 +6095,11 @@ function applyPrefs(s) {
   if (quotaLeft !== !!s.quotaLeft) {
     quotaLeft = !!s.quotaLeft;
     if (applyPrefs.painted) renderQuotas();
+  }
+  if (s.fx) fx = s.fx;
+  if (currency !== (s.currency || "usd")) {
+    currency = s.currency || "usd";
+    if (applyPrefs.painted) renderCosts();
   }
   applyPrefs.painted = true;
   const was = locale;
@@ -6018,29 +6147,31 @@ function renderSettings() {
   // the system's record, set on its own, not with the other choices
   $("#loginSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.login ? "on" : "off", (v) =>
     writingPrefs(api("settings/login", { on: v === "on" })).then((ns) => { prefs = ns; renderSettings(); }).catch((e) => { status(t(e.message), "err"); renderSettings(); })));
-  // a ChatGPT account's next window started as soon as the last resets
+  // Codex's and Claude Code's warm-ups and WorkBuddy's check-in, each under
+  // its service's heading, the rows' names not saying the service again.
+  // A ChatGPT account's next window started as soon as the last resets
   $("#warmSegs").replaceChildren(segs([["off", t("Off")], ["week", t("Weekly")], ["all", t("Weekly and 5-hour")]],
     s.codexWarmup || "off", (v) => savePrefs({ ...keep, codexWarmup: v === "off" ? "" : v })));
-  $("#warmSub").textContent = t("When a ChatGPT account's window resets, send it one tiny request so the next one starts counting at once")
+  $("#warmSub").textContent = t("One tiny request starts the next window at once")
     + (s.codexWarmed ? " · " + t("last started {when}", { when: syncWhen(s.codexWarmed) }) : "");
   // and a Claude account's, the request sent through Claude Code
   $("#claudeWarmSegs").replaceChildren(segs([["off", t("Off")], ["week", t("Weekly")], ["all", t("Weekly and 5-hour")]],
     s.claudeWarmup || "off", (v) => savePrefs({ ...keep, claudeWarmup: v === "off" ? "" : v })));
-  $("#claudeWarmSub").textContent = t("When a Claude account's window resets, send it one tiny request through Claude Code (Haiku) so the next one starts counting at once")
+  $("#claudeWarmSub").textContent = t("One tiny request through Claude Code (Haiku) starts the next window at once")
     + (s.claudeWarmed ? " · " + t("last started {when}", { when: syncWhen(s.claudeWarmed) }) : "");
   // and the 5-hour windows started at a time of day, so they line up with it
-  renderWarmAt($("#warmAtSegs"), $("#warmAtSub"), s.codexWarmAt, s.codexWarmup,
-    t("Start each ChatGPT account's 5-hour window at this time every day: 06:00 gives three by 21:00"),
+  renderWarmAt($("#warmAtSegs"), $("#warmAtSub"), s.codexWarmAt, s.codexWarmup, "",
     (v) => savePrefs({ ...keep, codexWarmAt: v }));
-  renderWarmAt($("#claudeWarmAtSegs"), $("#claudeWarmAtSub"), s.claudeWarmAt, s.claudeWarmup,
-    t("Start each Claude account's 5-hour window at this time every day, through Claude Code: 06:00 gives three by 21:00"),
+  renderWarmAt($("#claudeWarmAtSegs"), $("#claudeWarmAtSub"), s.claudeWarmAt, s.claudeWarmup, t("Sent through Claude Code."),
     (v) => savePrefs({ ...keep, claudeWarmAt: v }));
-  // WorkBuddy's daily check-in pressed for each account, shown while one is signed in
-  $("#wbCheckinRow").hidden = !s.workbuddy && !s.workbuddyCheckin;
+  // WorkBuddy's daily check-in pressed for each account, its group shown
+  // while one is signed in
+  $("#wbHead").hidden = $("#wbList").hidden = !s.workbuddy && !s.workbuddyCheckin;
   $("#wbCheckinSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.workbuddyCheckin ? "on" : "off",
     (v) => savePrefs({ ...keep, workbuddyCheckin: v === "on" })));
-  $("#wbCheckinSub").textContent = [t("Claim the daily check-in credits for each signed-in WorkBuddy (China) account once a day, as pressing 签到 in WorkBuddy does"),
+  $("#wbCheckinSub").textContent = [t("Claims each signed-in China account's check-in credits once a day"),
     ...(s.workbuddyCheckins || []).map(wbCheckinLine)].filter(Boolean).join(" · ");
+  $("#wbCheckinSub").title = t("As pressing 签到 in WorkBuddy does");
   renderTrayUsage(s, keep);
   renderProxy(s, keep);
   renderImages(s, keep);
@@ -6301,6 +6432,11 @@ const trayCardID = (q) => q.user ? q.provider + "|" + q.user : q.provider;
 function renderTrayUsage(s, keep) {
   $("#quotaLeftSegs").replaceChildren(segs([[false, t("Used")], [true, t("Left")]], !!s.quotaLeft,
     (on) => { if (on !== quotaLeft) setQuotaLeft(on); }));
+  $("#currencySegs").replaceChildren(segs(CURRENCIES.map(([id, name]) => [id, t(name)]), s.currency || "usd", (v) => savePrefs({ ...keep, currency: v })));
+  const rate = s.fx?.rate;
+  const currencySub = $("#currencySub");
+  currencySub.textContent = t("What a cost — the Usage page's, the tray panel's, the TUI's and the CLI's — is shown as; a vendor's own balance, already in its own currency, is never converted");
+  currencySub.title = rate ? t("1 USD = {rate} CNY{when}", { rate: rate.toFixed(2), when: s.fx.at ? " · " + (s.fx.stale ? t("last fetched {when}", { when: syncWhen(s.fx.at) }) : t("fetched {when}", { when: syncWhen(s.fx.at) })) : "" }) : "";
   $("#trayUsageRow").hidden = web;
   if (web) return;
   const mac = document.body.classList.contains("mac");
@@ -6374,12 +6510,14 @@ function renderProxy(s, keep) {
 }
 
 // renderWarmAt draws a daily warm-up's control: Off, or a time of day in
-// a time field, saved as it is changed; On picks 06:00 to begin with.
-function renderWarmAt(box, sub, at, onReset, what, save) {
-  // the fine print, too long for the line: what is left be, and how it
-  // goes with the warm-up on reset
+// a time field, saved as it is changed; On picks 06:00 to begin with, and
+// the field is there only while it is on. via says how the request goes.
+function renderWarmAt(box, sub, at, onReset, via, save) {
+  // the purpose on the line; the fine print, too long for it, in the
+  // title: what is left be, and how it goes with the warm-up on reset
+  const what = t("Starts each account's 5-hour window at this time every day");
   sub.textContent = what;
-  sub.title = [what, t("One tiny request, sent only to an account whose 5-hour window isn't running then."),
+  sub.title = [what, t("06:00 gives three by 21:00."), via, t("One tiny request, sent only to an account whose 5-hour window isn't running then."),
     t("A computer asleep then sends it on waking, up to an hour late; later than that, the day is left be."),
     onReset === "all" ? t("With Weekly and 5-hour on, a window that would still be running then isn't started on its reset: the windows follow one another from this time.") : ""].filter(Boolean).join("\n");
   box.replaceChildren();
@@ -6694,7 +6832,7 @@ function prefsKeep(s) {
   return { theme: s.theme, lang: s.lang, tray: s.tray, dock: !!s.dock, dockWindow: !!s.dockWindow, proxy: s.proxy || "",
     redact: !!s.redact, redactPersonal: !!s.redactPersonal, redactWords: s.redactWords || [], codexWarmup: s.codexWarmup || "",
     claudeWarmup: s.claudeWarmup || "", codexWarmAt: s.codexWarmAt || "", claudeWarmAt: s.claudeWarmAt || "", workbuddyCheckin: !!s.workbuddyCheckin, noStats: !!s.noStats,
-    trayUsage: s.trayUsage || "", trayUsageEvery: s.trayUsageEvery || 3, vision: s.vision || "", imageGen: s.imageGen || "" };
+    trayUsage: s.trayUsage || "", trayUsageEvery: s.trayUsageEvery || 3, vision: s.vision || "", imageGen: s.imageGen || "", currency: s.currency || "usd" };
 }
 
 // savePrefs sends what the page was drawn with (prefsBase) and the choice
@@ -6749,7 +6887,8 @@ function savePrefs(body) {
 //   A control under what it unrolls (data-unrolls: "Show 7 more") is the
 //   exception: it goes down with what it opens, and what's held is the
 //   part it is in, so the rows open downwards rather than the page riding
-//   up past them.
+//   up past them. A view at its top stays at its top: what comes in above
+//   the control there moves it down instead of scrolling itself out of sight.
 //
 // Code moves a view only in answer to a click that asks to go somewhere, and
 // shows that with the reader's event: scrollOnPurpose(e). Called without one
@@ -6831,7 +6970,13 @@ function hold(h) {
   if (!a) return;
   const v = h.v, d = onScreen(a[0], v) - a[1];
   if (Math.abs(d) >= 1) {
-    const want = v.scrollTop + d, max = v.scrollHeight - v.clientHeight;
+    let want = v.scrollTop + d;
+    const max = v.scrollHeight - v.clientHeight;
+    // a view at its top when clicked stays there rather than be given room
+    // to scroll down: a chip saved in the panel's Profiles came in above the
+    // button held, and room made for the button slid the chip up under the
+    // tabs, out of sight
+    if (want > max && h.top) want = max;
     if (want > max) setRoom(v, roomOf(v) + want - max);
     v.scrollTop = want;
   }
@@ -6861,7 +7006,7 @@ addEventListener("click", (e) => {
   for (let n = from; n && n !== v; n = n.parentElement) {
     for (const m of [n, n.previousElementSibling, n.nextElementSibling]) if (m instanceof HTMLElement && m.offsetParent) chain.push([m, onScreen(m, v)]);
   }
-  held = chain.length ? { v, chain, until: performance.now() + 4000 } : null;
+  held = chain.length ? { v, chain, until: performance.now() + 4000, top: v.scrollTop < 1 } : null;
   heldSizes.disconnect();
   if (held) for (const c of v.children) if (!c.classList.contains("view-room")) heldSizes.observe(c);
   if (held && !holding) { holding = true; requestAnimationFrame(keepHeld); }

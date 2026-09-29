@@ -18,6 +18,7 @@ import (
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/autostart"
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/fx"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/library"
 	"github.com/yetone/magpie/internal/netproxy"
@@ -76,6 +77,9 @@ type agentJSON struct {
 	// whether it has magpie already
 	Import string `json:"import,omitempty"`
 	Added  bool   `json:"added,omitempty"`
+	// Launch: the command that starts an agent taking the gateway only
+	// from its environment (agy) on magpie, to copy
+	Launch string `json:"launch,omitempty"`
 }
 
 // clientJSON is an agent, or another client the gateway knows, as a
@@ -107,6 +111,35 @@ type stateJSON struct {
 	Catalog  string            `json:"catalog"`
 	Notice   string            `json:"notice,omitempty"` // advice after a change, e.g. "restart Codex"
 	Settings settings.Settings `json:"settings"`
+	// FX is the dollar-to-yuan rate the cny currency choice shows costs at,
+	// here too (not only in settingsJSON) so a cost drawn before the reader
+	// ever opens Settings already converts, if cny was chosen last time.
+	FX fxJSON `json:"fx"`
+}
+
+// fxJSON is a USD→CNY rate as the UI shows it: the number a cost is
+// multiplied by, when it was last learned (unset for Fallback, never
+// learned from anywhere), and whether that's stale — the Settings page's
+// currency row puts these in its tooltip.
+type fxJSON struct {
+	Rate  float64    `json:"rate"`
+	At    *time.Time `json:"at,omitempty"`
+	Stale bool       `json:"stale"`
+}
+
+// currentFX asks internal/fx for the rate, bounded so a slow or absent
+// network never holds up a page's worth of state; its own cache makes this
+// return at once except right after each TTL (see internal/fx).
+func currentFX() fxJSON {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	r := fx.Get(ctx)
+	out := fxJSON{Rate: r.CNYPerUSD, Stale: r.Stale()}
+	if !r.At.IsZero() {
+		at := r.At
+		out.At = &at
+	}
+	return out
 }
 
 // settingsJSON is the Settings page: the two choices plus the facts it shows.
@@ -139,10 +172,13 @@ type settingsJSON struct {
 	// last daily check-in
 	WorkBuddy         bool                        `json:"workbuddy"`
 	WorkBuddyCheckins []provider.WorkBuddyCheckin `json:"workbuddyCheckins,omitempty"`
+	// FX is the dollar-to-yuan rate the cny currency choice shows costs at
+	FX fxJSON `json:"fx"`
 }
 
 func settingsState() settingsJSON {
 	s := settingsJSON{Settings: settings.Load(), Version: Version, Dir: tilde(settings.Dir()), Gateway: gateway.URL()}
+	s.FX = currentFX()
 	s.ProxyNow, s.ProxySource = netproxy.Describe()
 	s.Login = autostart.Enabled()
 	if s.LAN {
@@ -520,7 +556,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		case "hide":
 			w.HidePanel()
 		case "main":
-			w.ShowMain(r.URL.Query().Get("view"))
+			w.ShowMain(mainView(r.URL.Query()))
 		case "quit":
 			w.Quit()
 		case "fit":
@@ -541,6 +577,12 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 
 func state() stateJSON {
 	s := stateJSON{Agents: []agentJSON{}, Profiles: []profileJSON{}, Catalog: catalog.Source(), Settings: settings.Load()}
+	// state() is asked for after nearly every click, so the rate — a
+	// network fetch once every TTL — is only worth its rare latency when
+	// cny is actually chosen; usd never looks at it
+	if s.Settings.Currency == "cny" {
+		s.FX = currentFX()
+	}
 	for _, a := range agent.Clients() {
 		s.Clients = append(s.Clients, clientJSON{ID: a.ID, Name: a.Name, Icon: a.Icon})
 	}
@@ -557,6 +599,9 @@ func state() stateJSON {
 		aj.Drift = a.Drift()
 		if a.Import != nil {
 			aj.Import, aj.Added = a.Import(), a.Added != nil && a.Added()
+		}
+		if a.Launch != nil {
+			aj.Launch = a.Launch()
 		}
 		s.Agents = append(s.Agents, aj)
 	}

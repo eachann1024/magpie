@@ -28,6 +28,13 @@ a title, memories, a turn on Luna Reserve, a kind it does not know yet): each
 has a grey tag by its model in the Requests list, in English and Chinese, the
 model keeping its room first, and the request's story says what it was.
 
+`routing-served.test.cjs` lists a request whose vendor's reply names another
+model than the one asked for (gpt-6-sol served as gpt-6-luna), one answered
+under the model's dated name and ones naming none: only the first is marked
+"served gpt-6-luna" by its answer in the Requests list and "requested
+gpt-6-sol · served gpt-6-luna" in its story, in English and Chinese, and the
+click that picks it leaves the page where it is.
+
 `balance-fix.test.cjs` opens a custom provider whose balance token sits
 beside new-api's `/api/usage/token` (and a new one with a token and no
 Balance URL): the editor says so, one click moves it to `/api/user/self`
@@ -42,10 +49,50 @@ update clicked with the view scrolled (busy, then the new version, the page
 left where it was), a failed one giving its reason and the pill back, and
 the words in Chinese. Nothing is installed.
 
+`panel-profiles.test.cjs` saves a profile in the tray panel with the list
+scrolled to its end: "＋ Save current" opens the name field beside it, the
+list not moving, field and button in sight, one focus ring; the button then
+reads Save and a click on it saves, as Enter does; an empty name keeps the
+field; Escape closes it; in English and Chinese.
+
+`panel-routing.test.cjs` opens the tray panel's Routing tab: the gateway's
+latest requests from a faked trace, newest first, each with its agent, the
+model asked for, the provider and account it went to, the model that
+answered ("served gpt-6-luna" on the one a vendor answered with another, not
+on a dated name), a failure's status, and the time; today's calls and tokens
+over them; the allowances' tab named Allowances. A click, with the panel
+scrolled, asks for the window's Routing page on that request and moves
+nothing; the window opened so has that request picked. In English and
+Chinese.
+
+`login-import.test.cjs` brings ChatGPT accounts in from CLIProxyAPI's auth
+files: offered from the accounts list and from a browser sign-in under way,
+the box says the refresh spends the file's sign-in, what is pasted is posted
+as it is, and each account's outcome is listed, in English and Chinese.
+
+`agy-launch.test.cjs` gives Antigravity CLI's row the square that copies the
+command starting agy on magpie: the command in its tooltip, a click copying
+it with the page left where it was, none on other agents, in the tray
+panel's opened row too, in English and Chinese.
+
+`currency.test.cjs` shows a cost in dollars by default and in yuan, at
+magpie's cached exchange rate, once the Settings page's Currency row picks
+cny (#212): the Usage page's total converts, the row's tooltip carries the
+rate, picking it with the settings list scrolled well down moves nothing,
+and the choice survives a reload — in English and Chinese.
+
+`settings-groups.test.cjs` groups the Settings page's warm-ups and
+check-in by service (#124): Codex, Claude Code and WorkBuddy headings after
+Preferences, before Local network, their rows named without the service,
+the last warm-up and today's check-in still on the short lines, no left-border
+stripe; a daily warm-up's time field only while it is on; each control
+posting the setting it did, with the page scrolled and left where it was;
+the WorkBuddy group only with an account signed in; in English and Chinese.
+
 With Node.js and Playwright available:
 
 ```sh
-node --test internal/gui/tests/menu-scroll.test.cjs internal/gui/tests/click-scroll.test.cjs internal/gui/tests/panel-fold.test.cjs internal/gui/tests/gateway-fold.test.cjs internal/gui/tests/routing-kind.test.cjs internal/gui/tests/balance-fix.test.cjs internal/gui/tests/cli-update.test.cjs
+node --test internal/gui/tests/menu-scroll.test.cjs internal/gui/tests/click-scroll.test.cjs internal/gui/tests/panel-fold.test.cjs internal/gui/tests/panel-routing.test.cjs internal/gui/tests/gateway-fold.test.cjs internal/gui/tests/routing-kind.test.cjs internal/gui/tests/balance-fix.test.cjs internal/gui/tests/cli-update.test.cjs internal/gui/tests/login-import.test.cjs internal/gui/tests/agy-launch.test.cjs internal/gui/tests/currency.test.cjs
 ```
 
 If Playwright is installed outside the repository, set `NODE_PATH` to the

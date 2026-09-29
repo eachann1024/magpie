@@ -3,9 +3,11 @@ package provider
 import (
 	"context"
 	"fmt"
+	"log"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
@@ -114,6 +116,45 @@ func (p Provider) Fetch(ctx context.Context) ([]catalog.Model, error) {
 		return nil, err
 	}
 	return catalog.Chat(ms), catalog.SaveLive(p.ID, base, ms)
+}
+
+// newFetches is when each account with no list from its vendor yet was
+// last asked for one by FetchNew.
+var newFetches = struct {
+	sync.Mutex
+	m map[string]time.Time
+}{m: map[string]time.Time{}}
+
+// newFetchRetry is how long FetchNew leaves an account whose list it
+// couldn't get before asking again.
+var newFetchRetry = 10 * time.Minute
+
+// FetchNew asks each signed-in account whose vendor list magpie hasn't
+// fetched yet for it, each for at most timeout. Start-up does this for the
+// accounts there then; an account signed in while magpie runs (in magpie or
+// in the agent's own app) otherwise showed magpie's built-in list, fewer
+// models than the vendor serves, until Refresh was clicked (#204). One that
+// fails is asked again after newFetchRetry, not each time.
+func FetchNew(timeout time.Duration) {
+	newFetches.Lock()
+	defer newFetches.Unlock()
+	for _, p := range All() {
+		if p.Account == nil || !p.Ready() {
+			continue
+		}
+		if _, ok := p.Fetched(); ok {
+			continue
+		}
+		if t, ok := newFetches.m[p.ID]; ok && time.Since(t) < newFetchRetry {
+			continue
+		}
+		newFetches.m[p.ID] = time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		if _, err := p.Fetch(ctx); err != nil {
+			log.Println(p.ID + ": " + err.Error())
+		}
+		cancel()
+	}
 }
 
 // fetchOne asks the first endpoint that answers, with p's key.
@@ -368,20 +409,69 @@ func (p Provider) Known(model string) []string {
 			return []string{l}
 		}
 	}
-	return catalog.EffortsOf(model)
+	// one of the vendor's own its list leaves out (a preview) or typed in:
+	// the vendor's word on it, before the others'
+	if e, ok := catalog.ListedBy(p.Catalogs(), model); ok {
+		return e
+	}
+	return borrowedEfforts(model)
+}
+
+// Levelless reports whether the model is known to have no reasoning levels
+// to pick from, as against not known to have any: its vendor or its maker
+// lists it with a thinking switch alone, or nothing (Xiaomi's
+// mimo-v2.6-flash), and the user gave it none.
+func (p Provider) Levelless(model string) bool {
+	if len(p.Efforts(model)) > 0 {
+		return false
+	}
+	if e, ok := catalog.ListedBy(p.Catalogs(), model); ok {
+		return len(e) == 0
+	}
+	e, ok := catalog.ListedBy(makerCatalogs(), model)
+	return ok && len(e) == 0
 }
 
 // effortsOf is a model's reasoning levels: its vendor's, as models.dev
 // lists them, or — for a vendor models.dev doesn't list the model under (a
-// custom provider, a proxy) — the ones the others serving it give. A model
-// models.dev lists for this vendor without levels takes none: the vendor
-// says it has none to pick from.
+// custom provider, a proxy) — its maker's, else the ones the others serving
+// it give. A model models.dev lists for this vendor without levels takes
+// none: the vendor says it has none to pick from.
 func effortsOf(m catalog.Model) []string {
 	if len(m.Efforts) > 0 || m.Provider != "" {
 		return m.Efforts
 	}
-	return catalog.EffortsOf(m.ID)
+	return borrowedEfforts(m.ID)
 }
+
+// borrowedEfforts are the reasoning levels of a model its provider has no
+// word on: its maker's, when a vendor of magpie's presets makes it — none
+// for Xiaomi's mimo-v2.6-flash, which takes a thinking switch alone and
+// turns away the max resellers list for it (#214) — else those most of the
+// providers giving any give it (a Volcengine endpoint's glm-5.3-flash).
+func borrowedEfforts(id string) []string {
+	if e, ok := catalog.ListedBy(makerCatalogs(), id); ok {
+		return e
+	}
+	return catalog.EffortsOf(id)
+}
+
+// makerCatalogs are the models.dev ids of the vendors among the presets
+// that make the models they serve, in the presets' order.
+var makerCatalogs = sync.OnceValue(func() []string {
+	var out []string
+	for _, pr := range presets {
+		if pr.Kind != KindVendor || pr.Hosts {
+			continue
+		}
+		for _, c := range (Provider{Catalog: pr.Catalog}).Catalogs() {
+			if !slices.Contains(out, c) {
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+})
 
 // Chosen reports whether a model is exposed.
 func (p Provider) Chosen(id string) bool {
