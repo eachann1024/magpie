@@ -181,7 +181,9 @@ function renderAgentsLoading() {
   fit(); // the panel as tall as the rows, not as it was
 }
 
+let agentArranging = false, agentRenderPending = false;
 function renderAgents() {
+  if (agentArranging) { agentRenderPending = true; return; }
   const page = $("#view-agents");
   page.classList.remove("loading");
   page.removeAttribute("aria-busy");
@@ -695,57 +697,108 @@ function agentHandle(a, row, inFold) {
 // dragAgent moves a row in view up and down the list with the pointer; the
 // others make room as it passes, and letting go keeps the new order.
 function dragAgent(e, handle, row) {
-  if (e.button !== 0) return;
+  if (agentArranging) return;
   const list = $("#agents");
-  const rows = [...list.children].filter((r) => r.classList.contains("agent"));
-  if (rows.length < 2) return;
-  const y0 = e.clientY, from = rows.indexOf(row);
-  const tops = rows.map((r) => r.offsetTop), h = row.offsetHeight;
-  let dragging = false, to = from;
-  const move = (ev) => {
-    const dy = ev.clientY - y0;
-    if (!dragging) {
-      if (Math.abs(dy) < 4) return;
-      dragging = true;
-      handle.dataset.dragged = "1";
-      closeAgentMenu();
-      list.classList.add("sorting");
-      row.classList.add("dragging");
-    }
-    // the row follows the pointer, kept within the list
-    const min = tops[0] - tops[from], max = tops[rows.length - 1] + rows[rows.length - 1].offsetHeight - h - tops[from];
-    const d = Math.max(min, Math.min(max, dy));
+  agentArranging = dragRows(e, handle, row, list, [...list.children].filter((r) => r.classList.contains("agent")),
+    (to) => moveAgent(row.dataset.id, to), closeAgentMenu, () => {
+      agentArranging = false;
+      if (agentRenderPending) { agentRenderPending = false; renderAgents(); }
+    });
+}
+
+// Shared pointer sorter. Measure once, move only transforms on animation frames,
+// and commit once on release. No DOM rebuilds or network calls during a drag.
+// The same primitive serves agent handles and handle-free account rows.
+function dragRows(e, handle, row, list, rows, commit, start = () => {}, idle = () => {}) {
+  if (e.button !== 0 || e.isPrimary === false || rows.length < 2) return false;
+  const from = rows.indexOf(row);
+  if (from < 0) return false;
+  const rects = rows.map((r) => r.getBoundingClientRect());
+  const tops = rects.map((r) => r.top), heights = rects.map((r) => r.height), h = heights[from];
+  let scroll = list.parentElement;
+  while (scroll && !/(auto|scroll)/.test(getComputedStyle(scroll).overflowY)) scroll = scroll.parentElement;
+  scroll ||= document.scrollingElement;
+  const bounds = scroll.getBoundingClientRect(), scroll0 = scroll.scrollTop;
+  let dragging = false, ended = false, to = from, y = e.clientY, frame = 0, lastTime = 0;
+  const y0 = y, pointer = e.pointerId;
+  const paint = (time) => {
+    frame = 0;
+    if (!row.isConnected) return finish(false);
+    if (!dragging) return;
+    const dt = Math.min(32, lastTime ? time - lastTime : 16);
+    lastTime = time;
+    const edge = 36;
+    const speed = y < bounds.top + edge ? -Math.min(1, (bounds.top + edge - y) / edge)
+      : y > bounds.bottom - edge ? Math.min(1, (y - bounds.bottom + edge) / edge) : 0;
+    if (speed) scroll.scrollTop += speed * dt * .6;
+    const dy = y - y0 + scroll.scrollTop - scroll0;
+    const d = Math.max(tops[0] - tops[from], Math.min(tops.at(-1) + heights.at(-1) - h - tops[from], dy));
     row.style.transform = `translateY(${d}px)`;
     const mid = tops[from] + d + h / 2;
-    // past the middle of a row below (or above), the dragged one takes its place
-    if (d > 0) to = rows.slice(from + 1).filter((r, k) => mid >= tops[from + 1 + k] + r.offsetHeight / 2).length + from;
-    else to = from - rows.slice(0, from).filter((r, k) => mid <= tops[k] + r.offsetHeight / 2).length;
+    to = from;
+    if (d > 0) { while (to < rows.length - 1 && mid >= tops[to + 1] + heights[to + 1] / 2) to++; }
+    else { while (to > 0 && mid <= tops[to - 1] + heights[to - 1] / 2) to--; }
     rows.forEach((r, i) => {
       if (i === from) return;
       const shift = i > from && i <= to ? -h : i < from && i >= to ? h : 0;
       r.style.transform = shift ? `translateY(${shift}px)` : "";
     });
+    if (speed) frame = requestAnimationFrame(paint);
   };
-  const up = () => {
-    handle.removeEventListener("pointermove", move);
-    handle.removeEventListener("pointerup", up);
-    handle.removeEventListener("pointercancel", up);
-    if (!dragging) return;
-    // the row lands where it was let go, then the list is drawn in the new order
+  const move = (ev) => {
+    if (ev.pointerId !== pointer) return;
+    if (!row.isConnected || !handle.isConnected) return finish(false, ev);
+    y = ev.clientY;
+    if (!dragging) {
+      if (Math.abs(y - y0) < 4) return;
+      dragging = true;
+      handle.dataset.dragged = "1";
+      start();
+      list.classList.add("sorting");
+      row.classList.add("dragging");
+      getSelection()?.removeAllRanges();
+      handle.setPointerCapture(pointer);
+    }
+    ev.preventDefault();
+    if (!frame) frame = requestAnimationFrame(paint);
+  };
+  const finish = (save, ev) => {
+    if (ended || (ev?.pointerId != null && ev.pointerId !== pointer)) return;
+    if (save && dragging && ev) {
+      y = ev.clientY;
+      cancelAnimationFrame(frame);
+      paint(performance.now());
+    }
+    if (ended) return;
+    ended = true;
+    cancelAnimationFrame(frame);
+    document.removeEventListener("pointermove", move);
+    document.removeEventListener("pointerup", up);
+    document.removeEventListener("pointercancel", cancel);
+    document.removeEventListener("keydown", keys, true);
+    handle.removeEventListener("lostpointercapture", cancel);
+    removeEventListener("blur", cancel);
+    removeEventListener("resize", cancel);
+    if (handle.hasPointerCapture(pointer)) handle.releasePointerCapture(pointer);
+    list.classList.remove("sorting");
     row.classList.remove("dragging");
-    row.classList.add("landing");
-    row.style.transform = `translateY(${tops[to] - tops[from] + (to > from ? rows[to].offsetHeight - h : 0)}px)`;
-    setTimeout(() => {
-      list.classList.remove("sorting");
-      moveAgent(row.dataset.id, to);
-      if (to === from) renderAgents();
-      setTimeout(() => delete handle.dataset.dragged, 0);
-    }, 160);
+    rows.forEach((r) => { r.style.transform = ""; });
+    if (save && dragging && to !== from) commit(to);
+    idle();
+    // The click dispatched after pointerup must not rename, toggle or remove.
+    setTimeout(() => delete handle.dataset.dragged, 0);
   };
-  handle.setPointerCapture(e.pointerId);
-  handle.addEventListener("pointermove", move);
-  handle.addEventListener("pointerup", up);
-  handle.addEventListener("pointercancel", up);
+  const up = (ev) => finish(true, ev);
+  const cancel = (ev) => finish(false, ev);
+  const keys = (ev) => { if (ev.key === "Escape") { ev.preventDefault(); ev.stopImmediatePropagation(); finish(false); } };
+  document.addEventListener("pointermove", move, { passive: false });
+  document.addEventListener("pointerup", up);
+  document.addEventListener("pointercancel", cancel);
+  document.addEventListener("keydown", keys, true);
+  handle.addEventListener("lostpointercapture", cancel);
+  addEventListener("blur", cancel);
+  addEventListener("resize", cancel);
+  return true;
 }
 
 let agentMenu = null;
