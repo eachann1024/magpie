@@ -1689,6 +1689,7 @@ function renderProvidersLoading() {
 // One row per provider: logo, name, the agents pointed at it, key status.
 // Everything else lives in the editor, a dialog over the page.
 function renderProviders() {
+  if (accountArranging) { accountRenderPending = true; return; }
   // Rebuilding the list empties the page for a moment, which clamps its
   // scroll to the top; put it back so closing the editor leaves the reader
   // where they were.
@@ -2871,7 +2872,7 @@ function renderEditor(p, presetID) {
     // the sign-in belongs to the agent; magpie only borrows it
     const a = p.account;
     if (subOf(a.agent)) {
-      ed.append(...field(t("Accounts"), renderAccounts(a), p.routing ? t("Tick every account to use; Routing says how requests spread over them.") : subOf(a.agent).single ? t("{agent} keeps one account; the gateway runs it for every request. Signing in to another replaces it.", { agent: a.agentName }) : subOf(a.agent).own ? t("The gateway uses the first. Tick more and it moves on to the next when the one before it is out of quota. {agent} itself stays signed in as it is.", { agent: a.agentName }) : t("{agent} signs in to the first. Tick more and the gateway moves on to the next when the one before it is out of quota. Sessions already running keep theirs until restarted.", { agent: a.agentName })));
+      ed.append(...field(t("Accounts"), renderAccounts(a, p), p.routing ? t("Tick every account to use; Routing says how requests spread over them.") : subOf(a.agent).single ? t("{agent} keeps one account; the gateway runs it for every request. Signing in to another replaces it.", { agent: a.agentName }) : subOf(a.agent).own ? t("The gateway uses the first. Tick more and it moves on to the next when the one before it is out of quota. {agent} itself stays signed in as it is.", { agent: a.agentName }) : t("{agent} signs in to the first. Tick more and the gateway moves on to the next when the one before it is out of quota. Sessions already running keep theirs until restarted.", { agent: a.agentName })));
       if ((a.logins || []).filter((l) => l.active || l.on).length > 1) ed.append(...renderRouting(p));
     } else {
       const acct = el("div", "acct");
@@ -4073,21 +4074,92 @@ function renderSigning(sub) {
   return box;
 }
 
+// Display arrangement is independent of which account is signed in or preferred.
+// API calls share the existing provider store, not a browser-local preference.
+let accountArranging = false, accountSaving = false, accountRenderPending = false;
+function orderedAccounts(items, order, id) {
+  const rank = new Map((order || []).map((v, i) => [v, i]));
+  return [...items].sort((a, b) => (rank.get(id(a)) ?? rank.size) - (rank.get(id(b)) ?? rank.size));
+}
+function accountArrangementDone() {
+  accountArranging = false;
+  if (accountRenderPending) { accountRenderPending = false; renderProviders(); }
+}
+function arrangeAccountRows(list, p) {
+  const rows = [...list.children].filter((r) => r.dataset.accountId);
+  if (rows.length < 2) return;
+  list.classList.add("reorderable");
+  const move = async (row, to) => {
+    const current = [...list.children].filter((r) => r.dataset.accountId);
+    const from = current.indexOf(row);
+    if (accountSaving || to < 0 || to >= current.length || to === from) return;
+    accountSaving = accountArranging = true;
+    list.setAttribute("aria-busy", "true");
+    const before = p.accountOrder;
+    const focus = document.activeElement === row;
+    list.insertBefore(row, to > from ? current[to].nextSibling : current[to]);
+    current.splice(to, 0, ...current.splice(from, 1));
+    if (focus) row.focus({ preventScroll: true });
+    const order = current.map((r) => r.dataset.accountId);
+    p.accountOrder = order;
+    try {
+      await api("provider/arrange", { id: p.id, accountOrder: order });
+      const latest = providers?.providers.find((q) => q.id === p.id);
+      if (latest) latest.accountOrder = order;
+      status(t("Account order saved"), "ok");
+    } catch (e) {
+      p.accountOrder = before;
+      const latest = providers?.providers.find((q) => q.id === p.id);
+      if (latest) latest.accountOrder = before;
+      accountRenderPending = true;
+      status(e.message, "err");
+    } finally {
+      accountSaving = false;
+      list.removeAttribute("aria-busy");
+      accountArrangementDone();
+      if (focus) document.querySelector(`.accts [data-account-id="${CSS.escape(row.dataset.accountId)}"]`)?.focus({ preventScroll: true });
+    }
+  };
+  for (const row of rows) {
+    row.tabIndex = 0;
+    row.setAttribute("role", "group");
+    row.setAttribute("aria-label", row.querySelector(".n").textContent + " · " + t("Drag to reorder · Alt+↑/↓ to move"));
+    row.title = t("Drag to reorder · Alt+↑/↓ to move");
+    row.addEventListener("click", (e) => {
+      if (row.dataset.dragged) { e.preventDefault(); e.stopImmediatePropagation(); }
+    }, true);
+    row.onkeydown = (e) => {
+      if (e.target !== row || !e.altKey || !["ArrowUp", "ArrowDown"].includes(e.key) || accountArranging) return;
+      e.preventDefault(); e.stopPropagation();
+      const current = [...list.children].filter((r) => r.dataset.accountId);
+      move(row, current.indexOf(row) + (e.key === "ArrowUp" ? -1 : 1));
+    };
+    row.onpointerdown = (e) => {
+      if (accountArranging || e.target.closest("input, textarea, select, a, [contenteditable=true], button:not(.rename)")) return;
+      const current = [...list.children].filter((r) => r.dataset.accountId);
+      accountArranging = dragRows(e, row, row, list, current, (to) => move(row, to), () => {},
+        () => { if (!accountSaving) accountArrangementDone(); });
+    };
+  }
+}
+
 // renderAccounts: every account of an agent magpie has, the one the agent
 // is signed in to first, and a way to add another. Like keys, any number
 // can be ticked: the gateway moves to the next ticked account when the
 // first is out of quota. Each shows how much of its allowance is used, so
 // which one to go to next is plain to see.
-function renderAccounts(a) {
+function renderAccounts(a, p) {
   const sub = subOf(a.agent);
   const list = el("div", "accts");
   let ls = a.logins?.length ? [...a.logins] : [{ user: a.user, plan: a.plan, active: true, on: true }];
   ls.sort((x, y) => (y.active ? 1 : 0) - (x.active ? 1 : 0));
+  ls = orderedAccounts(ls, p.accountOrder, (l) => l.user);
   const several = ls.filter((l) => l.active || l.on).length > 1;
   const quota = loginUsageOf(a.agent);
   for (const l of ls) {
     const on = l.active || l.on;
     const row = el("div", "acc" + (on ? " in-use" : " off") + (l.user === justAdded ? " new" : ""));
+    row.dataset.accountId = l.user;
     const dot = el("button", "dot tick");
     if (on) dot.append(svg(CHECK, 10, 2.2));
     if (l.active) {
@@ -4136,6 +4208,7 @@ function renderAccounts(a) {
       list.append(imp);
     }
   }
+  arrangeAccountRows(list, p);
   return list;
 }
 
@@ -4481,8 +4554,9 @@ let addingKey = null;
 function renderKeyAccounts(p) {
   const list = el("div", "accts");
   const several = p.keyList.filter((k) => k.on).length > 1;
-  for (const k of p.keyList) {
+  for (const k of orderedAccounts(p.keyList, p.accountOrder, (k) => k.id)) {
     const row = el("div", "acc" + (k.on ? " in-use" : " off") + (k.id === justAdded ? " new" : ""));
+    row.dataset.accountId = k.id;
     // the dot is the switch: every key ticked is in use
     const dot = el("button", "dot tick");
     if (k.on) dot.append(svg(CHECK, 10, 2.2));
@@ -4556,6 +4630,7 @@ function renderKeyAccounts(p) {
     add.onclick = () => { addingKey = { id: p.id, name: "", key: "" }; renderProviders(); };
     list.append(add);
   }
+  arrangeAccountRows(list, p);
   return list;
 }
 
