@@ -98,6 +98,13 @@ func TestDeclaredGroupImageDispatch(t *testing.T) {
 			if tc.status == 400 && len(sent) != 0 {
 				t.Fatalf("rejected image reached upstream: %v", sent)
 			}
+			declaredImage := false
+			for _, in := range tc.input {
+				declaredImage = declaredImage || in == "image"
+			}
+			if tc.status == 400 && declaredImage && !strings.Contains(body, "none of group/root's members can take an image") {
+				t.Fatalf("declared image rejected as unsupported: %s", body)
+			}
 		})
 	}
 }

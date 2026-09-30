@@ -888,8 +888,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			}
 			cands, pl.order = kept, order
 			if len(cands) == 0 {
-				call.Status, call.Error = 400, "model does not support image input"
-				writeError(w, from, 400, fmt.Sprintf("model %q does not support image input", call.Model))
+				call.Status, call.Error = 400, "no member can take an image"
+				writeError(w, from, 400, fmt.Sprintf("none of %s's members can take an image", call.Model))
 				finishCapture()
 				s.record(call)
 				return
