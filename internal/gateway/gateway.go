@@ -896,6 +896,29 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			}
 		}
 	}
+	if isGroup {
+		// Expansion retains different boundaries until eligibility is known.
+		// Try equivalent payloads only once; described/omitted versus native
+		// image payloads remain distinct when the request contains images.
+		seen := map[inputSeat]bool{}
+		var kept []candidate
+		var order []Weighed
+		images := hasImage(from, body)
+		for i, c := range cands {
+			key := inputSeat{seat: c.seat()}
+			if images {
+				in := candidateImageInput(c)
+				key.textOnly = in != nil && !*in
+			}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			kept = append(kept, c)
+			order = append(order, pl.order[i])
+		}
+		cands, pl.order = kept, order
+	}
 	pin := strings.TrimSpace(r.Header.Get(AccountHeader))
 	if pin != "" {
 		var status int

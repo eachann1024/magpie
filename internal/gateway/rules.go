@@ -470,6 +470,9 @@ func applyRule(hit *RuleHit, ms []provider.Member, cs []candidate, pl planned) (
 // effort.
 func ofMember(c candidate, m provider.Member) bool {
 	id := m.Provider.ID
+	if len(c.path) > 0 && len(m.RoutePath()) > 0 && !slices.Equal(c.path, m.RoutePath()) {
+		return false
+	}
 	return c.model == m.Model && c.effort == m.Effort && (c.rest == id || strings.HasPrefix(c.rest, id+"#") || strings.HasPrefix(c.rest, id+"@"))
 }
 
@@ -509,11 +512,9 @@ func membersImageInput(ms []provider.Member, ruled []provider.Member) *bool {
 // candidateImageInput retains explicit text boundaries along the path as well
 // as the actual leaf capability; an Image declaration never changes the leaf.
 func candidateImageInput(c candidate) *bool {
-	for _, g := range c.via {
-		if g.Input != nil && !slices.Contains(g.Input, "image") {
-			textOnly := false
-			return &textOnly
-		}
+	if (provider.Member{Via: c.via}).TextOnlyPath() {
+		textOnly := false
+		return &textOnly
 	}
 	return membersImageInput([]provider.Member{{Provider: c.p, Model: c.model}}, nil)
 }

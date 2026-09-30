@@ -140,7 +140,8 @@ type Member struct {
 	// Path is the members from the group's own down to the model: [ID] for
 	// a model the group names itself, ["group/fast", "a/m"] for one of
 	// its group fast, and so on down.
-	Path []string
+	Path     []string
+	rootPath []string // retained when Below presents a nested group's view
 	// Via are the groups in the group it is of, the outermost first: the
 	// group each of Path's members but the last names.
 	Via      []Group
@@ -172,10 +173,23 @@ func (m Member) DeclaredInput() []string {
 	return nil
 }
 
+// RoutePath retains the original membership route when a subgroup views it.
+func (m Member) RoutePath() []string {
+	if m.rootPath != nil {
+		return m.rootPath
+	}
+	return m.Path
+}
+
+// TextOnlyPath reports an explicit text boundary anywhere along the route.
+func (m Member) TextOnlyPath() bool {
+	return slices.ContainsFunc(m.Via, func(g Group) bool { return g.Input != nil && !slices.Contains(g.Input, "image") })
+}
+
 // Below is the member as the group at depth (0 the group itself, 1 the
 // group in it Path[0] names, …) has it.
 func (m Member) Below(depth int) Member {
-	return Member{ID: m.Path[depth], Path: m.Path[depth:], Via: m.Via[depth:], Provider: m.Provider, Model: m.Model, Effort: m.Effort}
+	return Member{ID: m.Path[depth], Path: m.Path[depth:], rootPath: m.RoutePath(), Via: m.Via[depth:], Provider: m.Provider, Model: m.Model, Effort: m.Effort}
 }
 
 // maxNest is how deep groups in groups may go.
@@ -339,9 +353,14 @@ func groupOf(all []Group, id string) (Group, bool) {
 // where it was first — the same model at another effort is another
 // member — and a group that would be in itself is cut there. A manual
 // group has only the member picked (see Manual), however deep.
+// Distinct image boundaries are kept until the gateway knows the request's input.
 func membersIn(entries []Entry, all []Group, g Group) []Member {
 	var out []Member
-	seen := map[string]bool{}
+	type inputMember struct {
+		model    string
+		textOnly bool
+	}
+	seen := map[inputMember]bool{}
 	var walk func(g Group, path []string, via []Group, in []string)
 	walk = func(g Group, path []string, via []Group, in []string) {
 		for _, id := range g.routes() {
@@ -356,7 +375,7 @@ func membersIn(entries []Entry, all []Group, g Group) []Member {
 			}
 			model, effort := memberEffortIn(entries, id)
 			p, m, ok := resolveIn(entries, model)
-			key := WithMemberEffort(p.ID+"/"+m, effort)
+			key := inputMember{WithMemberEffort(p.ID+"/"+m, effort), (Member{Via: via}).TextOnlyPath()}
 			if !ok || seen[key] {
 				continue
 			}

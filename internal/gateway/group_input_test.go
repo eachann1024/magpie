@@ -14,11 +14,12 @@ import (
 
 func TestDeclaredGroupImageDispatch(t *testing.T) {
 	cases := []struct {
-		name                       string
-		input, childInput, members []string
-		child, rule                bool
-		status                     int
-		model                      string
+		name                          string
+		input, childInput, members    []string
+		child, rule                   bool
+		overlap, directFirst, sibling bool
+		status                        int
+		model                         string
 	}{
 		{name: "automatic mixed", members: []string{"qa/text", "qa/vision"}, status: 400},
 		{name: "declared mixed", input: []string{"text", "image"}, members: []string{"qa/text", "qa/vision"}, status: 200, model: "vision"},
@@ -26,6 +27,10 @@ func TestDeclaredGroupImageDispatch(t *testing.T) {
 		{name: "nested image", child: true, childInput: []string{"text", "image"}, members: []string{"qa/text", "qa/vision"}, status: 200, model: "vision"},
 		{name: "nested text", child: true, childInput: []string{"text"}, members: []string{"qa/vision"}, status: 400},
 		{name: "image parent text child", input: []string{"text", "image"}, child: true, childInput: []string{"text"}, members: []string{"qa/vision"}, status: 400},
+		{name: "overlap text path first", input: []string{"text", "image"}, child: true, childInput: []string{"text"}, members: []string{"qa/vision"}, overlap: true, status: 200, model: "vision"},
+		{name: "overlap direct first", input: []string{"text", "image"}, child: true, childInput: []string{"text"}, members: []string{"qa/vision"}, overlap: true, directFirst: true, status: 200, model: "vision"},
+		{name: "overlap text sibling first", input: []string{"text", "image"}, child: true, childInput: []string{"text"}, members: []string{"qa/vision"}, overlap: true, sibling: true, status: 200, model: "vision"},
+		{name: "overlap image sibling first", input: []string{"text", "image"}, child: true, childInput: []string{"text"}, members: []string{"qa/vision"}, overlap: true, sibling: true, directFirst: true, status: 200, model: "vision"},
 		{name: "all text", input: []string{"text", "image"}, members: []string{"qa/text"}, status: 400},
 		{name: "unknown", input: []string{"text", "image"}, members: []string{"qa/unknown"}, status: 200, model: "unknown"},
 		{name: "rule image child", child: true, rule: true, childInput: []string{"text", "image"}, members: []string{"qa/text", "qa/vision"}, status: 200, model: "vision"},
@@ -42,6 +47,8 @@ func TestDeclaredGroupImageDispatch(t *testing.T) {
 				sent = append(sent, req.Model)
 				if req.Model == "text" {
 					t.Error("native image sent to text member")
+				} else if !strings.Contains(string(b), "image_url") {
+					t.Error("eligible native image path lost its image")
 				}
 				w.Header().Set("Content-Type", "application/json")
 				io.WriteString(w, `{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
@@ -59,6 +66,20 @@ func TestDeclaredGroupImageDispatch(t *testing.T) {
 					t.Fatal(err)
 				}
 				root.Members = []string{"group/child"}
+				if tc.overlap {
+					extra := "qa/vision"
+					if tc.sibling {
+						if err := provider.SaveGroup(provider.Group{ID: "image-child", Members: []string{"qa/vision"}, Input: []string{"text", "image"}, Routing: provider.Ordered}); err != nil {
+							t.Fatal(err)
+						}
+						extra = "group/image-child"
+					}
+					if tc.directFirst {
+						root.Members = append([]string{extra}, root.Members...)
+					} else {
+						root.Members = append(root.Members, extra)
+					}
+				}
 				if tc.rule {
 					root.Members = append(root.Members, "qa/text")
 					root.Rules = []provider.Rule{{Use: "group/child", Images: true}}
