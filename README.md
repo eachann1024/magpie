@@ -227,6 +227,20 @@ the vendor's cache of it is worth keeping), `session`, `turn` or `off`.
 `models=` replaces the whole list, in order; a bare model id works when only
 one provider serves it.
 
+`magpie group set <id> input=auto` follows the members' input capabilities
+(the default). `input=text` explicitly declares text-only input;
+`input=text,image` declares text and image input. Text is required, and Pi
+currently supports only text and image here; audio, video and PDF are rejected.
+In Routing → Edit → Input types, Automatic is separate from the manual Text
+(required) and Image tags. Selecting Text leaves Automatic for text-only input;
+selecting Image declares text and image, and toggling Image off keeps manual
+text-only input. The group summary and group choices show effective input types.
+Saving or renaming a group in the app preserves its family and context settings.
+Image input means understanding images, not generating them (configured separately
+in Settings → Image generation). The “has an image” routing rule matches a request
+containing an image; it does not declare input support. Declaring Image does not
+make a text-only member accept images: the gateway still checks member capability.
+
 The app's Import from other apps dialog can copy providers from Claude Code's
 `settings.json` (`CLAUDE_CONFIG_DIR` when set) and Codex's `config.toml`
 (`CODEX_HOME` when set) into magpie. Codex imports custom
