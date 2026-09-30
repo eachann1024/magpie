@@ -136,10 +136,23 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         return {
           scroll: v.scrollTop,
           editor: !!ed,
-          top: Math.round((ed || group).getBoundingClientRect().top),
+          top: (ed || group).getBoundingClientRect().top,
         };
       });
       const beforeSave = await placeView();
+      await page.evaluate(() => {
+        const v = document.querySelector("#view-routing");
+        const top = () => (document.querySelector(".rt-gedit") || document.querySelector(".rt-group")).getBoundingClientRect().top;
+        const want = top(), scroll = v.scrollTop;
+        window.__saveMoves = [];
+        const look = () => {
+          if (v.scrollTop !== scroll || Math.abs(top() - want) > 1.5)
+            window.__saveMoves.push({ scroll: v.scrollTop, top: top() });
+        };
+        window.__saveObserver = new ResizeObserver(look);
+        for (const child of [v, ...v.children]) window.__saveObserver.observe(child);
+        v.addEventListener("scroll", look);
+      });
       await page.mouse.click(saveAt.x + saveAt.width / 2, saveAt.y + 4);
       const whileSaving = await placeView();
       assert.equal(whileSaving.scroll, beforeSave.scroll, "Save scrolled the page");
@@ -149,7 +162,17 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.waitForTimeout(700);
       const afterSave = await placeView();
       assert.equal(afterSave.scroll, beforeSave.scroll, "Save left the page elsewhere");
-      assert.equal(afterSave.top, beforeSave.top, "Save moved the group");
+      // WebKit scrolls in whole CSS pixels while layout keeps fractions.
+      // Compare the raw coordinates: rounding each separately turns a
+      // subpixel difference across .5 into a spurious one-pixel failure.
+      assert(Math.abs(afterSave.top - beforeSave.top) <= 1.5,
+        `Save moved the group: ${beforeSave.top} → ${afterSave.top}`);
+      const moves = await page.evaluate(() => { window.__saveObserver.disconnect(); return window.__saveMoves; });
+      assert.deepEqual(moves, [], "Save moved the page during layout or scrolling");
+      if (process.env.ARTIFACT_DIR) {
+        await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
+        await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `${engine}-${lang}-group-input.png`) });
+      }
       const save = posts.find((p) => p.path === "/api/groups/save");
       assert(save, `saved: ${JSON.stringify(posts)}`);
       assert.equal(save.body.id, "kept");
