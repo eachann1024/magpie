@@ -80,6 +80,10 @@ for DeepSeek on the model it searches with. Each has its grey tag (Title /
 was for, and picking a request moves nothing. Chromium and WebKit, English
 and Chinese.
 
+`group-input.test.cjs` edits a routing group in Chromium and WebKit, in
+English and Chinese: choosing Image leaves the page where it was, and Save
+posts that input together with the group's family and context.
+
 `routing-effort-row.test.cjs` lists live requests sent at high reasoning, one
 under way, one with two tries, in Chromium and WebKit, English and Chinese, at
 1440, 1000 and 480px: in every row the "· high" is shown whole and no run of
