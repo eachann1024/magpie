@@ -9471,11 +9471,17 @@ function fitRoom(v) {
   const r = roomOf(v);
   if (r) setRoom(v, Math.min(r, v.scrollTop + v.clientHeight - (v.scrollHeight - r)));
 }
+// scrollTop notifies scroll before the room is in the height. Holding
+// again in the same frame piles room on itself, and the page swings (WebKit).
+let heldThisFrame = false;
 function hold(h) {
+  if (heldThisFrame) return;
   const a = h.chain.find(([n]) => atRest(n));
   if (!a) return;
   const v = h.v, d = onScreen(a[0], v) - a[1];
   if (Math.abs(d) >= 1) {
+    heldThisFrame = true;
+    requestAnimationFrame(() => { heldThisFrame = false; });
     let want = v.scrollTop + d;
     const max = v.scrollHeight - v.clientHeight;
     // a view at its top when clicked stays there rather than be given room
