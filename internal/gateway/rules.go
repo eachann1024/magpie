@@ -509,8 +509,9 @@ func membersImageInput(ms []provider.Member, ruled []provider.Member) *bool {
 	return out
 }
 
-// candidateImageInput retains explicit text boundaries along the path as well
-// as the actual leaf capability; an Image declaration never changes the leaf.
+// candidateImageInput uses DeclaredInput: a text-only declaration anywhere
+// on the path blocks a native image, and an Image declaration never changes
+// the leaf.
 func candidateImageInput(c candidate) *bool {
 	if (provider.Member{Via: c.via}).TextOnlyPath() {
 		textOnly := false

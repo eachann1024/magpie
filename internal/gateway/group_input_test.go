@@ -134,3 +134,49 @@ func TestDeclaredTextGroupOmitsHistoricalImages(t *testing.T) {
 		t.Fatalf("%d %s; upstream %s", code, body, sent)
 	}
 }
+
+func TestAutoRootHidesImageBehindNestedText(t *testing.T) {
+	fresh(t)
+	noVision(t)
+	var sent []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var req struct{ Model string }
+		json.Unmarshal(b, &req)
+		sent = append(sent, req.Model)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer up.Close()
+	if err := provider.Save(provider.Provider{ID: "qa", Name: "QA", Chat: up.URL + "/v1", Key: "fixture", Models: []string{"vision"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.SaveLive("qa", up.URL+"/v1", []catalog.Model{{ID: "vision", Images: true, ImageInput: imageInputBool(true)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.SaveGroup(provider.Group{ID: "leaf", Members: []string{"qa/vision"}, Input: []string{"text"}, Routing: provider.Ordered}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.SaveGroup(provider.Group{ID: "mid", Members: []string{"group/leaf"}, Input: []string{"text", "image"}, Routing: provider.Ordered}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.SaveGroup(provider.Group{ID: "root", Members: []string{"group/mid"}, Routing: provider.Ordered}); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range provider.Served() {
+		switch e.ID {
+		case "group/root", "group/leaf":
+			if e.Images {
+				t.Fatalf("%s advertises images", e.ID)
+			}
+		case "group/mid":
+			if !e.Images {
+				t.Fatal("mid's own image declaration was dropped")
+			}
+		}
+	}
+	code, body := postAs(t, New(), "", `{"model":"group/root","messages":[{"role":"user","content":[{"type":"text","text":"read"},{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}]}]}`)
+	if code != 400 || len(sent) != 0 {
+		t.Fatalf("%d %s; sent %v", code, body, sent)
+	}
+}

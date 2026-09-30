@@ -163,14 +163,24 @@ func (m Member) Groups() []string {
 	return out
 }
 
-// DeclaredInput is the nearest subgroup's explicit advertised input boundary.
+// DeclaredInput is the route's explicit input boundary, the same rule image
+// dispatch uses. A text-only declaration anywhere along the path wins;
+// otherwise it is the outermost explicit declaration. Nil means every group
+// on the path infers from its members.
 func (m Member) DeclaredInput() []string {
+	var declared []string
 	for _, g := range m.Via {
-		if g.Input != nil {
+		if g.Input == nil {
+			continue
+		}
+		if !slices.Contains(g.Input, "image") {
 			return g.Input
 		}
+		if declared == nil {
+			declared = g.Input
+		}
 	}
-	return nil
+	return declared
 }
 
 // RoutePath retains the original membership route when a subgroup views it.
@@ -183,7 +193,8 @@ func (m Member) RoutePath() []string {
 
 // TextOnlyPath reports an explicit text boundary anywhere along the route.
 func (m Member) TextOnlyPath() bool {
-	return slices.ContainsFunc(m.Via, func(g Group) bool { return g.Input != nil && !slices.Contains(g.Input, "image") })
+	input := m.DeclaredInput()
+	return input != nil && !slices.Contains(input, "image")
 }
 
 // Below is the member as the group at depth (0 the group itself, 1 the
