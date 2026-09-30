@@ -37,6 +37,7 @@ type candidate struct {
 	// effort is the reasoning the group's member it is of is fixed at
 	// ("provider/model:low"); "" for one that follows the agent or the group
 	effort string
+	via    []provider.Group // subgroup boundaries along this candidate's path
 }
 
 // label names a candidate in a call's record: the provider, and the key
@@ -287,6 +288,7 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 		for _, l := range [][]candidate{cs, aside, left} {
 			for i := range l {
 				l[i].effort = m.Effort
+				l[i].via = m.Via
 			}
 		}
 		*asides = append(*asides, aside...)

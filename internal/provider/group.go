@@ -128,7 +128,8 @@ type Group struct {
 	Family string `json:"family,omitempty"`
 	// Auto is set on a group magpie found: one model served by several
 	// providers. It is derived, never stored.
-	Auto bool `json:"auto,omitempty"`
+	Input []string `json:"input,omitempty"` // nil follows members; otherwise "text" and optionally "image"
+	Auto  bool     `json:"auto,omitempty"`
 	// Hidden is stored for a found group the user removed.
 	Hidden bool `json:"hidden,omitempty"`
 }
@@ -159,6 +160,16 @@ func (m Member) Groups() []string {
 		out[i] = g.ID
 	}
 	return out
+}
+
+// DeclaredInput is the nearest subgroup's explicit advertised input boundary.
+func (m Member) DeclaredInput() []string {
+	for _, g := range m.Via {
+		if g.Input != nil {
+			return g.Input
+		}
+	}
+	return nil
 }
 
 // Below is the member as the group at depth (0 the group itself, 1 the
@@ -396,6 +407,13 @@ func groupEntries(entries []Entry) []Entry {
 					efforts, images, ctx, output, imageInput = x.Efforts, x.Images, x.Context, x.Output, x.ImageInput
 				}
 			}
+			if input := m.DeclaredInput(); input != nil {
+				images = slices.Contains(input, "image")
+				imageInput = nil
+				if !images {
+					imageInput = &images
+				}
+			}
 			if output > 0 && (e.Output == 0 || output < e.Output) {
 				e.Output = output
 			}
@@ -439,6 +457,14 @@ func groupEntries(entries []Entry) []Entry {
 			e.Images = false
 		}
 		ruledEntry(&e, g.Live(), ms, entries)
+		if g.Input != nil {
+			e.Input = slices.Clone(g.Input)
+			e.Images = slices.Contains(g.Input, "image")
+			e.ImageInput = nil // Image permits dispatch; leaves remain authoritative
+			if !e.Images {
+				e.ImageInput = &e.Images
+			}
+		}
 		if g.Context > 0 {
 			e.Context = g.Context
 		}
@@ -446,6 +472,34 @@ func groupEntries(entries []Entry) []Entry {
 		out = append(out, e)
 	}
 	return out
+}
+
+// cleanGroupInput normalizes the two input types supported by Pi. A nil
+// declaration means infer from the group as before; a set declaration is
+// explicit, and text is always required.
+func cleanGroupInput(g *Group) error {
+	if g.Input == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	for _, input := range g.Input {
+		input = strings.ToLower(strings.TrimSpace(input))
+		if input != "text" && input != "image" {
+			return fmt.Errorf("group input %q is unsupported (use text and image)", input)
+		}
+		seen[input] = true
+	}
+	if len(g.Input) == 0 {
+		return errors.New("group input needs text")
+	}
+	if !seen["text"] {
+		return errors.New("group input needs text")
+	}
+	g.Input = []string{"text"}
+	if seen["image"] {
+		g.Input = append(g.Input, "image")
+	}
+	return nil
 }
 
 // SaveGroup adds or replaces a group of the user's. Changing one magpie
@@ -461,6 +515,11 @@ func SaveGroup(g Group) error {
 	}
 	if g.Name == "" {
 		g.Name = g.ID
+	}
+	if g.Input != nil {
+		if err := cleanGroupInput(&g); err != nil {
+			return err
+		}
 	}
 	g.Members = cleanList(g.Members)
 	if len(g.Members) == 0 {

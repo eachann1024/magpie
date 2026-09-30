@@ -490,6 +490,13 @@ func membersImageInput(ms []provider.Member, ruled []provider.Member) *bool {
 				break
 			}
 		}
+		if input := m.DeclaredInput(); input != nil {
+			in = nil
+			if !slices.Contains(input, "image") {
+				textOnly := false
+				in = &textOnly
+			}
+		}
 		if i == 0 {
 			out = in
 			continue
@@ -497,6 +504,18 @@ func membersImageInput(ms []provider.Member, ruled []provider.Member) *bool {
 		out = sharedImageInput(out, in)
 	}
 	return out
+}
+
+// candidateImageInput retains explicit text boundaries along the path as well
+// as the actual leaf capability; an Image declaration never changes the leaf.
+func candidateImageInput(c candidate) *bool {
+	for _, g := range c.via {
+		if g.Input != nil && !slices.Contains(g.Input, "image") {
+			textOnly := false
+			return &textOnly
+		}
+	}
+	return membersImageInput([]provider.Member{{Provider: c.p, Model: c.model}}, nil)
 }
 
 // sharedImageInput is provider's: an explicit text-only answer wins, and

@@ -750,7 +750,14 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 		_, imageInput = provider.ApplyImage(p.ID, model, false, known)
 	}
-	// Unless a model that sees describes them to it (vision.go).
+	if isGroup && g.Input != nil {
+		imageInput = nil // Image permits dispatch without altering leaf capability
+		if !slices.Contains(g.Input, "image") {
+			textOnly := false
+			imageInput = &textOnly
+		}
+	}
+
 	seeing := sync.OnceValues(func() (string, bool) {
 		if describing(r.Context()) {
 			return "", false
@@ -866,13 +873,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			seenGroup = sync.OnceValues(func() ([]byte, error) { return s.seenBody(r.Context(), from, body, see) })
 		}
 	}
-	if isGroup && seenGroup == nil {
+	if isGroup && hasImage(from, body) {
 		_, currentImage := textOnlyBody(from, body)
-		if currentImage {
+		if currentImage && seenGroup == nil {
 			var kept []candidate
 			var order []Weighed
 			for i, c := range cands {
-				in := membersImageInput([]provider.Member{{Provider: c.p, Model: c.model}}, nil)
+				in := candidateImageInput(c)
 				if in != nil && !*in {
 					continue
 				}
@@ -933,7 +940,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			}
 		}
 		if isGroup {
-			if in := membersImageInput([]provider.Member{{Provider: c.p, Model: c.model}}, nil); in != nil && !*in {
+			if in := candidateImageInput(c); in != nil && !*in {
 				if seenGroup != nil {
 					b, err := seenGroup()
 					if err != nil {
