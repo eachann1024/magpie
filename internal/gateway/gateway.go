@@ -757,7 +757,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			imageInput = &textOnly
 		}
 	}
-
+	// Unless a model that sees describes them to it (vision.go).
 	seeing := sync.OnceValues(func() (string, bool) {
 		if describing(r.Context()) {
 			return "", false
