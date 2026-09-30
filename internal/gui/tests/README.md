@@ -82,7 +82,7 @@ and Chinese.
 
 `group-input.test.cjs` edits a routing group in Chromium and WebKit, in
 English and Chinese: choosing Image leaves the page where it was, and Save
-posts that input together with the group's family and context.
+posts that input together with the group's family, context and reasoning levels.
 
 `routing-effort-row.test.cjs` lists live requests sent at high reasoning, one
 under way, one with two tries, in Chromium and WebKit, English and Chinese, at

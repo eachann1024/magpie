@@ -1,7 +1,7 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
 // A routing group's input tags are separate from Automatic. Choosing Image
-// and saving posts text and image, and the family's and context already on
-// the group go with them. The click leaves the page where it was. English
+// and saving posts text and image, and the family's, context and reasoning
+// levels already on the group go with them. The click leaves the page where it was. English
 // and Chinese; Chromium and WebKit. No backend: the API is faked here.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
@@ -17,7 +17,7 @@ const groups = () => ({
   models,
   groups: [{
     id: "kept", name: "Kept", members: ["a/opus"], routing: "order", ready: true,
-    family: "claude", context: 200000, effectiveInput: ["text"],
+    family: "claude", context: 200000, levels: ["low", "high"], effectiveInput: ["text"],
     memberInfo: [{ id: "a/opus", ready: true, context: 1000000, images: true }], rules: [],
   }],
   pools: [],
@@ -156,6 +156,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(save.body.from, "kept");
       assert.equal(save.body.family, "claude");
       assert.equal(save.body.context, 200000);
+      assert.deepEqual(save.body.levels, ["low", "high"]);
       assert.deepEqual(save.body.input, ["text", "image"]);
       assert.deepEqual(save.body.members, ["a/opus"]);
       assert.deepEqual(errors, []);
