@@ -110,12 +110,28 @@ func split(file string) (before, block, after string, ok bool) {
 	if i < 0 {
 		return file, "", "", false
 	}
-	rest := file[i+len(blockBegin):]
-	j := strings.Index(rest, blockEnd)
-	if j < 0 {
-		return file, "", "", false
+	// A source accidentally linked to an output may already contain nested
+	// generated blocks. Match the outer end, keeping its tail out of own().
+	start, pos, depth := i+len(blockBegin), i+len(blockBegin), 1
+	for depth > 0 {
+		rest := file[pos:]
+		end := strings.Index(rest, blockEnd)
+		if end < 0 {
+			return file, "", "", false
+		}
+		begin := strings.Index(rest, blockBegin)
+		if begin >= 0 && begin < end {
+			depth++
+			pos += begin + len(blockBegin)
+			continue
+		}
+		depth--
+		if depth == 0 {
+			return file[:i], strings.TrimSpace(file[start : pos+end]), strings.ReplaceAll(file[pos+end+len(blockEnd):], blockEnd, ""), true
+		}
+		pos += end + len(blockEnd)
 	}
-	return file[:i], strings.TrimSpace(rest[:j]), rest[j+len(blockEnd):], true
+	return file, "", "", false
 }
 
 // own is the file without magpie's part: the user's own instructions.
@@ -154,6 +170,47 @@ func hash(s string) string {
 	return hex.EncodeToString(h[:8])
 }
 
+var errInstructionSource = errors.New("agent output aliases an instruction source")
+
+// checkInstructionOutput prevents writing generated text back into a library
+// source through a symlink or hard link. Check inactive sets and other agents'
+// additions too: disabling or importing an agent must not erase those sources.
+func (l *Library) checkInstructionOutput(path string) error {
+	target, err := edit.Target(path)
+	if err != nil {
+		return err
+	}
+	info, _ := os.Stat(path)
+	var sources []string
+	for _, set := range l.sets() {
+		sources = append(sources, setPath(set.ID))
+	}
+	ids := append([]string{}, l.Instructions.Agents...)
+	for id := range l.Applied {
+		ids = append(ids, id)
+	}
+	// Include additions for agents no longer installed or enabled.
+	extras, err := filepath.Glob(filepath.Join(Dir(), "instructions", "*.md"))
+	if err != nil {
+		return err
+	}
+	sources = append(sources, extras...)
+	for _, id := range ids {
+		sources = append(sources, extraPath(id))
+	}
+	for _, source := range sources {
+		resolved, err := edit.Target(source)
+		if err != nil {
+			return err
+		}
+		si, _ := os.Stat(source)
+		if target == resolved || (info != nil && si != nil && os.SameFile(info, si)) {
+			return fmt.Errorf("%w: %s points to %s; keep library sources separate from agent output files when adding agent-specific instructions", errInstructionSource, path, source)
+		}
+	}
+	return nil
+}
+
 // syncInstructions writes the agent's part as the library has it. A part
 // the user edited in the file is left alone until the library's text for
 // that agent changes; then it is replaced, the file kept aside first.
@@ -164,6 +221,16 @@ func (l *Library) syncInstructions(t *Target, b *backups, res *Result) {
 	id := t.Agent.ID
 	a := l.applied(id)
 	want := l.wanted(id)
+	if err := l.checkInstructionOutput(t.Instructions); err != nil {
+		// A directly shared source is already read by the agent: no wrapper
+		// is needed. Turning it off relinquishes management, not its text.
+		if errors.Is(err, errInstructionSource) && (want == "" || readText(t.Instructions) == want) {
+			a.Instructions, a.InstrHash = want != "", hash(want)
+			return
+		}
+		res.fail(id, "instructions", err)
+		return
+	}
 	raw, err := edit.Read(t.Instructions)
 	if err != nil {
 		res.fail(id, "instructions", err)
@@ -175,7 +242,7 @@ func (l *Library) syncInstructions(t *Target, b *backups, res *Result) {
 		a.Instructions, a.InstrHash = false, ""
 		return
 	}
-	if ok && have == want {
+	if ok && have == want && strings.Count(file, blockEnd) == strings.Count(have, blockEnd)+1 {
 		a.Instructions, a.InstrHash = want != "", hash(want)
 		return
 	}
@@ -323,6 +390,9 @@ func ImportInstructions(id string) (*Result, error) {
 		return nil, fmt.Errorf("%s has no instructions file magpie knows", id)
 	}
 	return change(func(l *Library) error {
+		if err := l.checkInstructionOutput(t.Instructions); err != nil {
+			return err
+		}
 		raw, err := edit.Read(t.Instructions)
 		if err != nil {
 			return err
