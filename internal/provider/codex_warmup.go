@@ -6,7 +6,9 @@ package provider
 // its next week end a day later too. So, while the setting is on, whichever
 // magpie runs the gateway looks at each account's windows every few minutes
 // and, when one has started over — its reset time passed, or its use fell
-// back (OpenAI resetting everyone's limits early) — and nothing has used it
+// back (OpenAI resetting everyone's limits early), or, unused, it is no
+// longer started and resets later than it ran to (a reset that follows a
+// reset card's with nothing used in between) — and nothing has used it
 // since, sends that account one tiny request, as the gateway sends any.
 // Once per reset: what it saw and did is kept in codex-warmup.json, so a
 // restart doesn't send it again. A window still not started after one —
@@ -22,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -68,6 +71,9 @@ type warmWindow struct {
 	// when it is sent the next while it still isn't.
 	Idle  int       `json:"idle,omitempty"`
 	Retry time.Time `json:"retry,omitzero"`
+	// Absent is an expected window the account hasn't (windowAbsent),
+	// never warmed while its reading leaves it out.
+	Absent bool `json:"absent,omitempty"`
 }
 
 // warmState is every account's windows, by lower-cased user and window name.
@@ -104,15 +110,44 @@ type codexWarmer struct {
 	// warmed, when set, is told of an account a request went to, so what
 	// it has left is read again rather than taken from before.
 	warmed func(user string)
+	// ownAt, when set, is the accounts that have a time of day of their
+	// own, by name in lower case, "" for none: theirs in place of the ones
+	// warmNow is given (#957).
+	ownAt func() map[string]string
+}
+
+// atOf is the times of day user's 5-hour window starts at: its own, else
+// ats.
+func (c codexWarmer) atOf(own map[string]string, user string, ats []string) []string {
+	if a, ok := own[strings.ToLower(user)]; ok {
+		if a == "" {
+			return nil
+		}
+		return []string{a}
+	}
+	return ats
+}
+
+// owned is c's accounts' own times of day, none when it has no ownAt.
+func (c codexWarmer) owned() map[string]string {
+	if c.ownAt == nil {
+		return nil
+	}
+	return c.ownAt()
 }
 
 // warmNow reads each account's windows, the weekly ones or with which
 // "all" the 5-hour ones too, sends a request to each account one of them
-// has started over on — or whose 5-hour window isn't running at the time
-// of day at ("06:00", "" none) — and keeps what it saw.
-func (c codexWarmer) warmNow(ctx context.Context, which, at string) []CodexWarm {
+// has started over on — or whose 5-hour window isn't running at one of
+// the times of day dayAts ("06:00", none for none), or the account's own
+// (ownAt) — and keeps what it saw.
+func (c codexWarmer) warmNow(ctx context.Context, which string, dayAts []string) []CodexWarm {
+	if settings.AccountDiscoveryOff() {
+		return nil
+	}
 	st := readWarmState(c.path)
 	now := c.now()
+	own := c.owned()
 	usage := c.usage(ctx)
 	users := make([]string, 0, len(usage))
 	for u := range usage {
@@ -127,21 +162,30 @@ func (c codexWarmer) warmNow(ctx context.Context, which, at string) []CodexWarm 
 			continue // nothing known: what was seen stands
 		}
 		key := strings.ToLower(user)
+		at := c.atOf(own, user, dayAts)
 		prev, next := st[key], map[string]warmWindow{}
 		var due []string
 		onReset, days := map[string]bool{}, map[string]string{}
-		unstarted := map[string]bool{}
+		unstarted, long := map[string]bool{}, map[string]bool{}
+		waitDay := false
 		for _, w := range withExpected(q.Windows, c.expect) {
 			// the weekly windows on their reset while it is on, the 5-hour
 			// ones with "all" and for the day's start
 			short := w.Span < 24*time.Hour
 			onItsReset := which == "all" || which != "" && !short
-			if w.Span <= 0 || w.Aside || w.Model != "" || !onItsReset && !(short && at != "") {
+			if w.Span <= 0 || w.Aside || w.Model != "" || !onItsReset && !(short && len(at) > 0) {
+				continue
+			}
+			p, seen := prev[w.Name]
+			if windowAbsent(q, w, p, now) {
+				// an account without it (a Claude Enterprise plan with five
+				// hours only): warmed, it stayed not started, sent again
+				// every few hours for good (koohoko5924, Idle 189)
+				next[w.Name] = warmWindow{Absent: true}
 				continue
 			}
 			cur := asOf(w, now)
 			unstarted[w.Name] = idle(cur, now)
-			p, seen := prev[w.Name]
 			n := warmWindow{Used: cur.Used, Warmed: p.Warmed, Daily: p.Daily}
 			if cur.ResetsAt != nil {
 				n.ResetsAt = *cur.ResetsAt
@@ -159,6 +203,11 @@ func (c codexWarmer) warmNow(ctx context.Context, which, at string) []CodexWarm 
 				// it waits for the day's start, kept as it was till then
 				reset = false
 			}
+			if short && unstarted[w.Name] && !daily && heldForDay(at, w.Span, now) {
+				// any request now would start it, to run past the day's start
+				waitDay = true
+			}
+			long[w.Name] = !short
 			if reset || daily {
 				due = append(due, w.Name)
 				onReset[w.Name] = reset
@@ -171,6 +220,10 @@ func (c codexWarmer) warmNow(ctx context.Context, which, at string) []CodexWarm 
 				n = p
 			}
 			next[w.Name] = n
+		}
+		if waitDay {
+			// the weekly windows wait for the day's start too, kept as they were
+			due = slices.DeleteFunc(due, func(name string) bool { return long[name] })
 		}
 		if len(due) > 0 {
 			r := CodexWarm{User: user, Windows: due}
@@ -231,6 +284,33 @@ func withExpected(ws, expect []QuotaWindow) []QuotaWindow {
 	return out
 }
 
+// windowAbsent says whether w, as withExpected gives it, is a window q's
+// account hasn't, as it was seen before as p: one every account is
+// expected to have that q's reading leaves out while a shorter window of
+// the account runs, never seen running itself. Any use starts each of
+// Claude's windows, the week with the five hours, so a week left out
+// while the five hours run is one the plan doesn't have, not one not
+// started yet. Taken so, it is so while readings leave it out, the five
+// hours idle too; a reading that has it, the account used since, ends it.
+// A week seen running and left out now, reset while the five hours run,
+// is not started, as is any window a reading only partly told
+// (claudeUsageEntry.whole) leaves out.
+func windowAbsent(q SubscriptionQuota, w QuotaWindow, p warmWindow, now time.Time) bool {
+	if slices.ContainsFunc(q.Windows, func(x QuotaWindow) bool { return x.Name == w.Name }) {
+		return false
+	}
+	return p.Absent || p.ResetsAt.IsZero() && p.Used == 0 && !slices.ContainsFunc(q.Windows, func(x QuotaWindow) bool { return x.partial }) &&
+		shorterRunning(q.Windows, w.Span, now)
+}
+
+// shorterRunning says whether one of ws, the account's own and shorter
+// than span, is running as of now.
+func shorterRunning(ws []QuotaWindow, span time.Duration, now time.Time) bool {
+	return slices.ContainsFunc(ws, func(x QuotaWindow) bool {
+		return x.Span > 0 && x.Span < span && !x.Aside && x.Model == "" && !idle(asOf(x, now), now)
+	})
+}
+
 // windowSeen is window name of q as now, as warmNow keeps it; one q
 // leaves out is not started.
 func windowSeen(q SubscriptionQuota, name string, now time.Time) warmWindow {
@@ -254,7 +334,7 @@ func mapsEqual(a, b map[string]warmWindow) bool {
 	for k, x := range a {
 		y, ok := b[k]
 		if !ok || !x.ResetsAt.Equal(y.ResetsAt) || x.Used != y.Used || !x.Warmed.Equal(y.Warmed) || x.Failed != y.Failed || x.Pending != y.Pending || x.Daily != y.Daily ||
-			x.Idle != y.Idle || !x.Retry.Equal(y.Retry) {
+			x.Idle != y.Idle || !x.Retry.Equal(y.Retry) || x.Absent != y.Absent {
 			return false
 		}
 	}
@@ -278,7 +358,9 @@ func asOf(w QuotaWindow, now time.Time) QuotaWindow {
 // warmDue says whether a window seen as p (seen false the first time) and
 // now as cur wants starting: it is unused, and has started over since p —
 // or is seen for the first time. Use falling back is a reset whatever the
-// window says, OpenAI resetting everyone's limits early among them. One
+// window says, OpenAI resetting everyone's limits early among them; so is
+// a window seen running, unused, that now isn't started and resets later
+// than it was to, which has no use to fall from. One
 // whose warm-up failed is still due, and one still not started is due
 // again once its Retry comes, even with a reset time reported.
 func warmDue(p warmWindow, seen bool, cur QuotaWindow, now time.Time) bool {
@@ -291,12 +373,33 @@ func warmDue(p warmWindow, seen bool, cur QuotaWindow, now time.Time) bool {
 		return !now.Before(p.Retry)
 	case p.Used-cur.Used >= 1:
 		return true
+	case !p.ResetsAt.IsZero() && idle(cur, now) && movedOn(p, cur):
+		// not started now, its reset gone from the one it ran to: started
+		// over with nothing to fall from, as a window a reset was spent on
+		// and a warm-up started, unused since, when OpenAI then resets
+		// everyone's limits early
+		return true
 	case !p.ResetsAt.IsZero() && !now.Before(p.ResetsAt):
 		return idle(cur, now)
 	case p.ResetsAt.IsZero() && p.Used == 0:
 		return idle(cur, now) && !now.Before(p.Retry)
 	}
 	return false
+}
+
+// movedOn says whether a window seen as p now resets (cur) later than
+// both the reset it was seen running to and the end of a window magpie's
+// last warm-up started: one that has started over since. A window left
+// out of the read, or with no reset, hasn't started at all.
+func movedOn(p warmWindow, cur QuotaWindow) bool {
+	if cur.ResetsAt == nil {
+		return true
+	}
+	if cur.ResetsAt.Sub(p.ResetsAt) < warmSlack {
+		return false
+	}
+	// a read that kept the old reset, then the window the warm-up started
+	return p.Warmed.IsZero() || cur.ResetsAt.Sub(p.Warmed.Add(cur.Span)) >= warmSlack
 }
 
 // idle says whether a window (as of now) hasn't started: nothing used,
@@ -330,17 +433,17 @@ func warmCodexLogin(ctx context.Context, user string) error {
 	l := ls[i]
 	token := func(ctx context.Context) (string, string, error) { return savedLoginToken(ctx, "codex", l.User) }
 	if l.Active {
-		token = func(ctx context.Context) (string, string, error) { return codexToken(ctx, codexAuthPath()) }
+		token = func(ctx context.Context) (string, string, error) { return codexToken(ctx, codexHome()) }
 	}
 	model, effort, err := warmModel(l.User)
 	if err != nil {
 		return err
 	}
-	return warmCodex(ctx, codexSign(token), model, effort)
+	return warmCodex(ViaLogin(ctx, "codex", user), codexSign(token), model, effort)
 }
 
 // warmModel is the model a warm-up asks, and at what effort: the account's
-// smallest (a mini) or else the first it lists, at low.
+// cheapest (warmPick), at low.
 func warmModel(user string) (model, effort string, err error) {
 	ms, _, ok := catalog.Live(accountModels("codex", user))
 	if !ok {
@@ -352,10 +455,7 @@ func warmModel(user string) (model, effort string, err error) {
 	if len(ms) == 0 {
 		return "", "", errors.New("no Codex model is known yet")
 	}
-	m := ms[0]
-	if i := slices.IndexFunc(ms, func(m catalog.Model) bool { return strings.Contains(m.ID, "mini") }); i >= 0 {
-		m = ms[i]
-	}
+	m := warmPick(ms, func(id string) (catalog.Price, bool) { return catalog.PricedBy([]string{"openai"}, id) })
 	switch {
 	case slices.Contains(m.Efforts, "low"):
 		effort = "low"
@@ -363,6 +463,34 @@ func warmModel(user string) (model, effort string, err error) {
 		effort = m.Efforts[0]
 	}
 	return m.ID, effort, nil
+}
+
+// warmPick is the cheapest of an account's models, by its list price where
+// models.dev has one (#604: GPT-6's cheap one is gpt-6-luna; the list
+// has no mini and starts with the flagship gpt-6.1-sol); with no price
+// known, a mini, else a luna, else the first it lists.
+func warmPick(ms []catalog.Model, price func(id string) (catalog.Price, bool)) catalog.Model {
+	best, cost := -1, 0.0
+	for i, m := range ms {
+		p, ok := catalog.Price{}, false
+		if m.Price != nil {
+			p, ok = *m.Price, true
+		} else {
+			p, ok = price(m.ID)
+		}
+		if c := p.Input + p.Output; ok && c > 0 && (best < 0 || c < cost) {
+			best, cost = i, c
+		}
+	}
+	if best >= 0 {
+		return ms[best]
+	}
+	for _, word := range []string{"mini", "luna"} {
+		if i := slices.IndexFunc(ms, func(m catalog.Model) bool { return strings.Contains(m.ID, word) }); i >= 0 {
+			return ms[i]
+		}
+	}
+	return ms[0]
 }
 
 // warmCodex sends one "hi" to the ChatGPT backend as a Codex account's
@@ -383,7 +511,8 @@ func warmCodex(ctx context.Context, sign func(context.Context, *http.Request, []
 	if err := sign(ctx, req, body); err != nil {
 		return err
 	}
-	res, err := http.DefaultClient.Do(req)
+	CodexCompressed(req, body) // as Codex sends a turn
+	res, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return err
 	}
@@ -412,24 +541,65 @@ func codexWarmedIn(path string) map[string]time.Time {
 	return out
 }
 
+// codexWarmAtOf is the ChatGPT accounts' own times of day (settings'
+// CodexWarmAtOf), "" for one that has none.
+func codexWarmAtOf() map[string]string {
+	of := settings.Load().CodexWarmAtOf
+	out := make(map[string]string, len(of))
+	for user, at := range of {
+		if at == "off" {
+			at = ""
+		}
+		out[user] = at
+	}
+	return out
+}
+
+// CodexWarmAtOf is user's own time of day to start its 5-hour window at,
+// "off" for none; false when it follows settings' CodexWarmAts.
+func CodexWarmAtOf(user string) (string, bool) {
+	at, ok := settings.Load().CodexWarmAtOf[strings.ToLower(strings.TrimSpace(user))]
+	return at, ok
+}
+
+// SetCodexWarmAt gives user a time of day of its own ("06:00"), none
+// ("off"), or, "", has it follow settings' CodexWarmAts again.
+func SetCodexWarmAt(user, at string) error {
+	user = strings.ToLower(strings.TrimSpace(user))
+	if user == "" {
+		return fmt.Errorf("which Codex account?")
+	}
+	s := settings.Load()
+	of := maps.Clone(s.CodexWarmAtOf)
+	if of == nil {
+		of = map[string]string{}
+	}
+	delete(of, user)
+	if at = strings.TrimSpace(at); at != "" {
+		of[user] = at
+	}
+	s.CodexWarmAtOf = of
+	return settings.Save(s)
+}
+
 // KeepCodexWindowsWarm starts the ChatGPT accounts' windows as they reset,
 // while settings say to, two minutes after it starts and every
 // codexWarmEvery after that, until ctx ends.
 func KeepCodexWindowsWarm(ctx context.Context) {
 	w := codexWarmer{path: codexWarmPath(), now: time.Now, usage: codexWarmUsage, send: warmCodexLogin,
-		warmed: func(user string) { StaleAllowance("codex", user) }}
-	keepWarm(ctx, "codex", w, func() (string, string) { s := settings.Load(); return s.CodexWarmup, s.CodexWarmAt })
+		warmed: func(user string) { StaleAllowance("codex", user) }, ownAt: codexWarmAtOf}
+	keepWarm(ctx, "codex", w, func() (string, []string) { s := settings.Load(); return s.CodexWarmup, s.CodexWarmAts })
 }
 
 // keepWarm runs w while prefs (the settings: which windows on their
-// reset, and the time of day to start the 5-hour one at) say to: two
+// reset, and the times of day to start the 5-hour one at) say to: two
 // minutes after it starts and every codexWarmEvery after that, and as soon
-// as the time of day comes, until ctx ends. The time is the wall clock's,
+// as one of the times of day comes, until ctx ends. The time is the wall clock's,
 // looked at every minute: a machine that slept through it notices on
 // waking. A usage read that finds an account's window not started — one
 // never used, which routing leaves for last — has it run at once too, for
 // each account at most every warmKickEvery.
-func keepWarm(ctx context.Context, name string, w codexWarmer, prefs func() (which, at string)) {
+func keepWarm(ctx context.Context, name string, w codexWarmer, prefs func() (which string, ats []string)) {
 	t := time.NewTimer(2 * time.Minute)
 	defer t.Stop()
 	kick := make(chan string, 16)
@@ -457,7 +627,7 @@ func keepWarm(ctx context.Context, name string, w codexWarmer, prefs func() (whi
 		}
 		// the wall clock, which goes on while the machine sleeps
 		now := w.now().Round(0)
-		if which, at := prefs(); (which != "" || at != "") && (now1 || last.IsZero() || now.Sub(last) >= codexWarmEvery || dayStartPassed(at, last, now)) {
+		if which, at := prefs(); !leftAlone(name) && warmLook(which, at, w.owned(), now1, last, now) {
 			last = now
 			c, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			for _, r := range w.warmNow(c, which, at) {
@@ -477,6 +647,22 @@ func keepWarm(ctx context.Context, name string, w codexWarmer, prefs func() (whi
 			t.Reset(time.Minute)
 		}
 	}
+}
+
+// warmLook says whether keepWarm looks at the windows now: a warm-up is
+// on — on reset (which), or at a time of day, the ones for all (at) or an
+// account's own — and a read kicked it (kicked), it hasn't looked yet, it
+// last looked codexWarmEvery ago, or one of those times came since.
+func warmLook(which string, at []string, own map[string]string, kicked bool, last, now time.Time) bool {
+	ats := slices.Clone(at)
+	for _, a := range own {
+		ats = append(ats, a)
+	}
+	if which == "" && !slices.ContainsFunc(ats, func(a string) bool { return a != "" }) {
+		return false
+	}
+	return kicked || last.IsZero() || now.Sub(last) >= codexWarmEvery ||
+		dayStartPassed(ats, last, now)
 }
 
 // notStartedHooks is, by agent, what a usage read finding an account's
@@ -510,7 +696,8 @@ func onNotStarted(agent string, expect []QuotaWindow, f func(user string)) func(
 
 // usageRead tells onNotStarted's f of each account in usage, read for
 // agent, with a window not started: nothing used and no reset known, or
-// left out of the read.
+// left out of the read, but for one left out while a shorter window runs,
+// which the account hasn't (windowAbsent).
 func usageRead(agent string, usage map[string]SubscriptionQuota) {
 	h := &notStartedHooks
 	h.Lock()
@@ -519,8 +706,18 @@ func usageRead(agent string, usage map[string]SubscriptionQuota) {
 	if !ok {
 		return
 	}
+	now := time.Now()
 	for user, q := range usage {
-		if q.Error == "" && slices.ContainsFunc(withExpected(q.Windows, hook.expect), notStarted) {
+		if q.Error != "" {
+			continue
+		}
+		ws := q.Windows
+		for _, e := range hook.expect {
+			if !slices.ContainsFunc(q.Windows, func(w QuotaWindow) bool { return w.Name == e.Name }) && !shorterRunning(q.Windows, e.Span, now) {
+				ws = append(slices.Clip(ws), QuotaWindow{Name: e.Name, Span: e.Span})
+			}
+		}
+		if slices.ContainsFunc(ws, notStarted) {
 			hook.f(user)
 		}
 	}

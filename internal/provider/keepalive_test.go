@@ -58,7 +58,7 @@ func TestRenewLogins(t *testing.T) {
 		t.Fatalf("refreshed with %v", got)
 	}
 	l := saved()
-	if !strings.Contains(string(l.Auth), `"r-2"`) || time.Since(l.Renewed) > time.Minute || !renewalDue(l, keepAliveEvery, time.Now().Add(25*time.Hour)) {
+	if !strings.Contains(string(l.Auth), `"r-2"`) || time.Since(l.Renewed) > time.Minute || !renewalDue(l, keepAliveEvery, time.Now().Add(keepAliveEvery+time.Hour)) {
 		t.Fatalf("saved after renewal: %+v", l)
 	}
 	var live codexAuth
@@ -116,11 +116,6 @@ func TestRenewLogins(t *testing.T) {
 
 func TestRenewalDue(t *testing.T) {
 	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
-	claude := func(refreshEnds time.Time) []byte {
-		b, _ := json.Marshal(map[string]any{"claudeAiOauth": map[string]any{"accessToken": "a", "refreshToken": "r",
-			"refreshTokenExpiresAt": refreshEnds.UnixMilli()}})
-		return b
-	}
 	codex := func(last time.Time) []byte {
 		b, _ := json.Marshal(map[string]any{"tokens": map[string]any{"access_token": "a"}, "last_refresh": last.Format(time.RFC3339Nano)})
 		return b
@@ -130,12 +125,14 @@ func TestRenewalDue(t *testing.T) {
 		l    savedLogin
 		due  bool
 	}{
-		{"never renewed, seen long ago", savedLogin{Agent: "claude", Seen: now.Add(-48 * time.Hour), Auth: claude(now.Add(30 * 24 * time.Hour))}, true},
-		{"seen in the agent's hands today", savedLogin{Agent: "claude", Seen: now.Add(-time.Hour), Auth: claude(now.Add(30 * 24 * time.Hour))}, false},
-		{"renewed today", savedLogin{Agent: "claude", Seen: now.Add(-72 * time.Hour), Renewed: now.Add(-time.Hour), Auth: claude(now.Add(30 * 24 * time.Hour))}, false},
-		{"refresh token nearly out", savedLogin{Agent: "claude", Renewed: now.Add(-time.Hour), Auth: claude(now.Add(30 * time.Hour))}, true},
+		{"never renewed, seen long ago", savedLogin{Agent: "codex", Seen: now.Add(-9 * 24 * time.Hour)}, true},
+		{"never renewed, seen two days ago", savedLogin{Agent: "codex", Seen: now.Add(-48 * time.Hour)}, false},
+		{"seen in the agent's hands today", savedLogin{Agent: "codex", Seen: now.Add(-time.Hour)}, false},
+		{"renewed today", savedLogin{Agent: "codex", Seen: now.Add(-30 * 24 * time.Hour), Renewed: now.Add(-time.Hour)}, false},
 		{"codex refreshed itself lately", savedLogin{Agent: "codex", Seen: now.Add(-72 * time.Hour), Auth: codex(now.Add(-2 * time.Hour))}, false},
-		{"codex a day since", savedLogin{Agent: "codex", Seen: now.Add(-72 * time.Hour), Auth: codex(now.Add(-25 * time.Hour))}, true},
+		{"codex a day since", savedLogin{Agent: "codex", Seen: now.Add(-72 * time.Hour), Auth: codex(now.Add(-25 * time.Hour))}, false},
+		{"codex a week since", savedLogin{Agent: "codex", Seen: now.Add(-30 * 24 * time.Hour), Auth: codex(now.Add(-7 * 24 * time.Hour))}, false},
+		{"codex eight days since", savedLogin{Agent: "codex", Seen: now.Add(-30 * 24 * time.Hour), Auth: codex(now.Add(-8*24*time.Hour - time.Minute))}, true},
 	} {
 		if got := renewalDue(c.l, keepAliveEvery, now); got != c.due {
 			t.Errorf("%s: due %v", c.name, got)

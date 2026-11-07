@@ -3,6 +3,8 @@ package gateway
 import (
 	"bytes"
 	"encoding/json"
+	"maps"
+	"net/http"
 	"regexp"
 	"slices"
 	"strings"
@@ -32,12 +34,28 @@ var bedrockRefuses = []string{
 	"redact-thinking-2026-02-12",
 }
 
+// askedBetas are the betas an agent asked in its anthropic-beta header,
+// but for its own sign-in's: Claude Code signed in to claude.ai asks
+// oauth-2025-04-20, which names a credential that never leaves magpie, so
+// a provider gets the request as magpie's key sends it.
+func askedBetas(in http.Header) []string {
+	var out []string
+	for _, v := range in.Values("anthropic-beta") {
+		for _, b := range strings.Split(v, ",") {
+			if b = strings.TrimSpace(b); b != "" && !strings.HasPrefix(b, "oauth-") {
+				out = append(out, b)
+			}
+		}
+	}
+	return out
+}
+
 // betaKey is a beta a provider refused, as remembered in unfit.
 func betaKey(beta string) string { return "anthropic-beta\x00" + beta }
 
 // betas is the list asked (header values, each maybe comma-separated),
-// fitted to what p takes: renamed and left out as Bedrock wants, without
-// those p has refused, and without repeats.
+// fitted to what p takes: renamed as Bedrock and Vertex AI want, left out
+// as Bedrock does, without those p has refused, and without repeats.
 func (s *Server) betas(p provider.Provider, asked []string) []string {
 	var out []string
 	for _, v := range asked {
@@ -46,10 +64,12 @@ func (s *Server) betas(p provider.Provider, asked []string) []string {
 			if b == "" {
 				continue
 			}
-			if p.IsBedrock() {
+			if p.IsBedrock() || p.IsVertex() {
 				if to, ok := bedrockBetas[b]; ok {
 					b = to
 				}
+			}
+			if p.IsBedrock() {
 				if slices.Contains(bedrockRefuses, b) {
 					continue
 				}
@@ -61,6 +81,27 @@ func (s *Server) betas(p provider.Provider, asked []string) []string {
 		}
 	}
 	return out
+}
+
+// fitUserBetas fits the anthropic-beta a signed request carries when the
+// provider has one of the user's own (header.anthropic-beta), which Sign
+// added after the agent's: a beta of the user's is left out only once the
+// provider has refused it, as the agent's are, and the retry goes without.
+// The header keeps the name as the user wrote it.
+func (s *Server) fitUserBetas(p provider.Provider, h http.Header) {
+	if !slices.ContainsFunc(slices.Collect(maps.Keys(p.Headers)), provider.ListHeader) {
+		return
+	}
+	for k, vs := range h {
+		if !provider.ListHeader(k) {
+			continue
+		}
+		if bs := s.betas(p, vs); len(bs) > 0 {
+			h[k] = []string{strings.Join(bs, ",")}
+		} else {
+			delete(h, k)
+		}
+	}
 }
 
 // bodyBetas fits a body's anthropic_beta list, as Bedrock's InvokeModel
@@ -106,16 +147,27 @@ var unexpectedBetas = regexp.MustCompile("(?i)unexpected values?(?:\\(s\\))?\\s+
 
 var backquoted = regexp.MustCompile("`([^`]+)`")
 
+// unsupportedBetas is Copilot's word for the same: 400 "unsupported beta
+// header(s): tool-search-tool-2025-10-19", the name Claude Code asks tool
+// search by in Claude Desktop's Code tab once its toolSearchEnabled policy
+// is on. Copilot answers the same request without it, defer_loading tools
+// and all (and with advanced-tool-use-2025-11-20).
+var unsupportedBetas = regexp.MustCompile(`(?i)unsupported beta headers?(?:\(s\))?:\s*([a-z0-9][a-z0-9._-]*(?:\s*,\s*[a-z0-9][a-z0-9._-]*)*)`)
+
 // refuseBetas reads the betas an error from p names as unknown, remembers
 // them so p isn't asked them again, and returns those it hadn't already.
 func (s *Server) refuseBetas(p provider.Provider, errBody []byte) []string {
-	m := unexpectedBetas.FindSubmatch(errBody)
-	if m == nil {
-		return nil
+	var named []string
+	if m := unexpectedBetas.FindSubmatch(errBody); m != nil {
+		for _, q := range backquoted.FindAllSubmatch(m[1], -1) {
+			named = append(named, string(q[1]))
+		}
+	} else if m := unsupportedBetas.FindSubmatch(errBody); m != nil {
+		named = strings.Split(string(m[1]), ",")
 	}
 	var fresh []string
-	for _, q := range backquoted.FindAllSubmatch(m[1], -1) {
-		b := strings.TrimSpace(string(q[1]))
+	for _, b := range named {
+		b = strings.TrimSpace(b)
 		if b != "" && s.fits(p.ID, betaKey(b), provider.Anthropic) {
 			s.markUnfit(p.ID, betaKey(b), provider.Anthropic)
 			fresh = append(fresh, b)

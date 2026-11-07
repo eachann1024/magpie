@@ -32,9 +32,43 @@ func (m *model) reloadGroups() {
 	m.shown = len(m.groups)
 	m.groups = append(m.groups, removed...)
 	m.grow = clamp(m.grow, len(m.groups))
+	m.provOff = map[string]bool{}
+	for _, p := range provider.All() {
+		if !p.On() {
+			m.provOff[p.ID] = true
+		}
+	}
 }
 
-var routings = []string{"", provider.Ordered, provider.Rotate, provider.LeastUsed}
+// memberOff is whether a member of a group is a model of a provider
+// switched off: the group keeps it (one magpie found too, #2671) and the
+// gateway skips it until the provider is on again.
+func (m model) memberOff(id string) bool {
+	if provider.IsGroupRef(id) {
+		return false
+	}
+	pid, _, ok := strings.Cut(id, "/")
+	return ok && m.provOff[pid]
+}
+
+// listedMembers are the members a group's line lists: of a group magpie
+// found, those its providers being on lets it send to (XYenon on Discord:
+// a provider switched off was still listed in it), as every model list
+// leaves a provider switched off out, and how many it left out; all of
+// them when that would leave none. A group of the user's lists what they
+// put in.
+func (m model) listedMembers(g provider.Group) ([]string, int) {
+	if !g.Auto {
+		return g.Members, 0
+	}
+	on := slices.DeleteFunc(slices.Clone(g.Members), m.memberOff)
+	if len(on) == 0 {
+		return g.Members, 0
+	}
+	return on, len(g.Members) - len(on)
+}
+
+var routings = []string{"", provider.Ordered, provider.Rotate, provider.LeastUsed, provider.Pace, provider.Weighted, provider.FreeFirst, provider.Fastest, provider.Cheapest, provider.Drain, provider.FreeExpiring, provider.Manual}
 
 func routingName(v string) string {
 	switch v {
@@ -44,8 +78,32 @@ func routingName(v string) string {
 		return "rotate"
 	case provider.LeastUsed:
 		return "least used"
+	case provider.Pace:
+		return "weekly pace"
+	case provider.Weighted:
+		return "by weight"
+	case provider.FreeFirst:
+		return "free first"
+	case provider.Fastest:
+		return "speed first"
+	case provider.Cheapest:
+		return "cheapest first"
+	case provider.Drain:
+		return "until used up"
+	case provider.FreeExpiring:
+		return "free, soonest to expire"
+	case provider.Manual:
+		return "manual"
 	}
 	return "smart"
+}
+
+// groupRouting is how a group routes: a manual one names its pick.
+func groupRouting(g provider.Group) string {
+	if g.Routing == provider.Manual {
+		return "manual → " + g.Picked()
+	}
+	return routingName(g.Routing)
 }
 
 func staysName(v string) string {
@@ -56,6 +114,8 @@ func staysName(v string) string {
 		return "stays a turn"
 	case provider.AffinityOff:
 		return "never stays"
+	case provider.AffinityStrict:
+		return "stays strictly"
 	}
 	return "stays auto"
 }
@@ -173,15 +233,33 @@ type pickMsg struct{ group, newGroup string }
 // memberOptions is every model and group magpie has, but those in skip.
 func memberOptions(skip []string, self string) []agent.Option {
 	var out []agent.Option
-	for _, e := range provider.Catalog() {
-		if slices.Contains(skip, e.ID) || e.ID == provider.GroupPrefix+self {
-			continue
+	// a group is of decision models alone, asked at /v1/systemone, or of
+	// models that hold conversations (provider.cleanDecisionGroup): one
+	// holding either is offered more of the same, a new one both
+	g, _ := findGroup(self)
+	decides := self != "" && g.Decides()
+	if !decides {
+		// every model a group can be made of: those kept out of the lists
+		// agents see too (a provider kept for routing groups, a group's
+		// with listed=no, #1783), as the Routing view's picker offers
+		for _, e := range provider.Served() {
+			if slices.Contains(skip, e.ID) || slices.Contains(skip, provider.CanonicalRef(e.ID)) || e.Group != "" && e.Group == self {
+				continue
+			}
+			note := e.Name
+			if e.Group != "" {
+				note = "group · " + e.Name
+			}
+			out = append(out, agent.Option{Value: e.ID, Note: note})
 		}
-		note := e.Name
-		if e.Group != "" {
-			note = "group · " + e.Name
+	}
+	if self == "" || decides {
+		// those of a provider's picks, as the Routing view's picker offers
+		for _, e := range provider.OfferedDeciders(nil) {
+			if !slices.Contains(skip, e.ID) {
+				out = append(out, agent.Option{Value: e.ID, Note: e.Name + " · decision model"})
+			}
 		}
-		out = append(out, agent.Option{Value: e.ID, Note: note})
 	}
 	return out
 }
@@ -199,6 +277,7 @@ func (m *model) openMemberPicker(p pickMsg) {
 		crumbs: crumbs,
 		input:  newInput("filter models and groups"),
 		items:  memberOptions(skip, p.group),
+		relist: func() []agent.Option { return memberOptions(skip, p.group) },
 		empty:  empty,
 		onPick: func(id string) tea.Cmd {
 			if p.group != "" {
@@ -226,21 +305,25 @@ func (m *model) openMemberPicker(p pickMsg) {
 // openClassifier picks the model that tells which intent a message is:
 // a model, or another group whose models are tried in turn.
 func (m *model) openClassifier(g provider.Group) {
-	var items []agent.Option
-	for _, e := range provider.Catalog() {
-		if e.Group == g.ID {
-			continue // it can't classify for itself
+	list := func() []agent.Option {
+		var items []agent.Option
+		for _, e := range provider.Catalog() {
+			if e.Group == g.ID {
+				continue // it can't classify for itself
+			}
+			note := e.Name
+			if e.ID == g.Classifier {
+				note = "● now · " + note
+			}
+			items = append(items, agent.Option{Value: e.ID, Note: note})
 		}
-		note := e.Name
-		if e.ID == g.Classifier {
-			note = "● now · " + note
-		}
-		items = append(items, agent.Option{Value: e.ID, Note: note})
+		return items
 	}
 	m.pk = picker{
 		crumbs: []string{"routing", g.Name, "classifier"},
 		input:  newInput("filter models · best a small fast one without reasoning"),
-		items:  items,
+		items:  list(),
+		relist: list,
 		empty:  "magpie has no models yet · add a provider first",
 		onPick: func(id string) tea.Cmd {
 			return saveGroup(g.ID, func(g *provider.Group) error { g.Classifier = id; return nil }, g.Name+" classifies with "+id)
@@ -253,7 +336,10 @@ func (m *model) openClassifier(g provider.Group) {
 
 // ruleHint is what a rule is typed as.
 const ruleHint = `use=<model>, and any of: tokens=200k · images · effort=on|low|medium|high|xhigh|max · agents=codex,claude
-intent="a quick question" (the group's classifier=<model> tells it) · at=<n> for its place`
+intent="a quick question" (the group's classifier=<model> tells it) · compact
+time=09:00-18:00 (22:00-08:00 runs past midnight) · days=mon-fri · tz=Asia/Shanghai (this computer's zone if none) · folders=~/work/acme,~/oss · except-folders=~/old · at=<n> for its place
+use-effort=low|medium|high|xhigh|max: the reasoning the model is asked for, whatever the agent asked
+or pause=<model> time=… days=… agents=… folders=… except-folders=…: the model is left out of the group then, not even a fallback`
 
 // openRule asks for a rule: a new one, or rule i (from 0) typed again.
 func (m *model) openRule(g provider.Group, i int) {
@@ -283,6 +369,7 @@ func putRule(g *provider.Group, i int, line string) error {
 	if err != nil {
 		return err
 	}
+	r.InZoneHere()
 	if classifier != "" {
 		g.Classifier = classifier
 	}
@@ -370,6 +457,29 @@ func (m model) updateGroup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.openClassifier(g)
+	case "E", "F":
+		// the model's own effort and fast mode, whatever the agent asks
+		if onRule || n == 0 || provider.IsGroupRef(g.Members[m.gsel]) {
+			return m, nil
+		}
+		id := g.Members[m.gsel]
+		if key == "F" {
+			fast := !g.IsFast(id)
+			said := " not fast"
+			if fast {
+				said = " fast"
+			}
+			return m, saveGroup(g.ID, func(g *provider.Group) error {
+				g.SetMemberFast(id, fast)
+				return nil
+			}, id+said)
+		}
+		model, effort := provider.MemberEffort(id)
+		to := provider.WithMemberEffort(model, nextMemberEffort(effort))
+		return m, saveGroup(g.ID, func(g *provider.Group) error {
+			g.RenameMember(id, to)
+			return nil
+		}, to+" set")
 	case "o":
 		return m, saveGroup(g.ID, nextRouting, g.Name+" routing changed")
 	case "s":
@@ -389,7 +499,7 @@ func (m model) updateGroup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			in.SetValue(fmt.Sprint(g.Context))
 		}
 		m.openAsk(ask{crumbs: []string{"routing", g.Name, "context"}, input: in, empty: true,
-			hint: "how long a request agents are told the group takes, rather than its shortest model's",
+			hint: "how long a request agents are told the group takes, rather than its largest model's",
 			onEnter: func(v string) tea.Cmd {
 				return saveGroup(g.ID, func(g *provider.Group) error {
 					if v == "" {
@@ -402,6 +512,19 @@ func (m model) updateGroup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}, g.Name+" context "+dash(v))
 			}})
 		m.back = modeGroup
+	case "l":
+		in := newInput("e.g. low,medium,high,xhigh · empty for those its models share")
+		in.SetValue(strings.Join(g.Levels, ","))
+		m.openAsk(ask{crumbs: []string{"routing", g.Name, "levels"}, input: in, empty: true,
+			hint: "the reasoning levels agents are offered: " + strings.Join(provider.Levels, ", ") + "; a model without the one asked is sent its nearest",
+			onEnter: func(v string) tea.Cmd {
+				return saveGroup(g.ID, func(g *provider.Group) error {
+					var err error
+					g.Levels, err = provider.CleanLevels(strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ' ' }))
+					return err
+				}, g.Name+" levels "+dash(v))
+			}})
+		m.back = modeGroup
 	case "R":
 		in := newInput("the group's new id")
 		in.SetValue(g.ID)
@@ -410,7 +533,7 @@ func (m model) updateGroup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			hint: "agents pick it as group/<id>: those on it, and the groups that have it in them, follow",
 			onEnter: func(to string) tea.Cmd {
 				return func() tea.Msg {
-					if err := provider.RenameGroup(g.ID, to); err != nil {
+					if _, err := agent.RenameGroup(g.ID, to); err != nil {
 						return flashMsg{text: err.Error()}
 					}
 					return renamedMsg{from: g.ID, to: strings.ToLower(to)}
@@ -443,7 +566,7 @@ func (m model) updateGroup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.confirm != "member/"+id {
 			m.confirm = "member/" + id
 			m.flash, m.flashOK = "press d again to take "+id+" out", false
-			if slices.ContainsFunc(g.Rules, func(r provider.Rule) bool { return r.Use == id }) {
+			if slices.ContainsFunc(g.Rules, func(r provider.Rule) bool { _, kept := r.Without(id); return !kept }) {
 				m.flash += " and its rules"
 			}
 			return m, nil
@@ -452,11 +575,25 @@ func (m model) updateGroup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.gsel = clamp(m.gsel, all-1)
 		return m, saveGroup(g.ID, func(g *provider.Group) error {
 			g.Members = slices.DeleteFunc(g.Members, func(x string) bool { return x == id })
-			g.Rules = slices.DeleteFunc(g.Rules, func(r provider.Rule) bool { return r.Use == id })
+			// a rule that sends to others too keeps them
+			var rules []provider.Rule
+			for _, r := range g.Rules {
+				if r, kept := r.Without(id); kept {
+					rules = append(rules, r)
+				}
+			}
+			g.Rules = rules
 			return nil
 		}, id+" taken out")
 	}
 	return m, nil
+}
+
+// nextMemberEffort is the effort E sets a member at after effort: the
+// agent's (""), then low to max, then the agent's again.
+func nextMemberEffort(effort string) string {
+	cycle := []string{"", "low", "medium", "high", "xhigh", "max"}
+	return cycle[(slices.Index(cycle, effort)+1)%len(cycle)]
 }
 
 // renamedMsg is a group given another id: the page follows it.
@@ -472,7 +609,7 @@ func (m model) viewGroups() string {
 	}
 	nameW, idW := 0, 0
 	for _, g := range m.groups {
-		nameW, idW = max(nameW, lipgloss.Width(dash(g.Name))), max(idW, lipgloss.Width(provider.GroupPrefix+g.ID))
+		nameW, idW = max(nameW, lipgloss.Width(dash(g.Name))), max(idW, lipgloss.Width(g.Ref()))
 	}
 	visible := max(3, m.h-7)
 	start := 0
@@ -491,12 +628,16 @@ func (m model) viewGroups() string {
 		if i == m.grow {
 			marker, name = sCursor.Render("▸ "), sNameOn.Render(padRight(dash(g.Name), nameW))
 		}
-		line := pad + marker + name + "  " + sFaint.Render(padRight(provider.GroupPrefix+g.ID, idW))
+		line := pad + marker + name + "  " + sFaint.Render(padRight(g.Ref(), idW))
 		if g.Hidden {
 			b.WriteString(line + "\n")
 			continue
 		}
-		notes := []string{fmt.Sprintf("%d model%s", len(g.Members), plural(len(g.Members))), routingName(g.Routing)}
+		listed, off := m.listedMembers(g)
+		notes := []string{fmt.Sprintf("%d model%s", len(listed), plural(len(listed))), groupRouting(g)}
+		if off > 0 {
+			notes = append(notes, fmt.Sprintf("%d switched off", off))
+		}
 		if g.Affinity != "" {
 			notes = append(notes, staysName(g.Affinity))
 		}
@@ -509,7 +650,10 @@ func (m model) viewGroups() string {
 		if g.Auto {
 			notes = append(notes, "found")
 		}
-		members := strings.Join(g.Members, " → ")
+		members := strings.Join(listed, " → ")
+		if len(g.Match) > 0 {
+			notes = append(notes, fmt.Sprintf("%d pattern%s", len(g.Match), plural(len(g.Match))))
+		}
 		line += "  " + sText.Render(strings.Join(notes, " · "))
 		if room := m.w - lipgloss.Width(line) - 4; room > 10 {
 			line += "  " + sMuted.Render(trunc(members, room))
@@ -524,9 +668,12 @@ func (m model) viewGroup() string {
 	var b strings.Builder
 	b.WriteString(m.header("routing", g.Name))
 	b.WriteString("\n\n")
-	head := []string{provider.GroupPrefix + g.ID, routingName(g.Routing), staysName(g.Affinity)}
+	head := []string{g.Ref(), groupRouting(g), staysName(g.Affinity)}
 	if g.Context > 0 {
 		head = append(head, "context "+fmtTokens(g.Context))
+	}
+	if len(g.Levels) > 0 {
+		head = append(head, "levels "+strings.Join(g.Levels, "/"))
 	}
 	if g.Family != "" {
 		head = append(head, "family "+g.Family)
@@ -536,26 +683,100 @@ func (m model) viewGroup() string {
 	}
 	b.WriteString(pad + "  " + sMuted.Render(strings.Join(head, " · ")) + "\n\n")
 	b.WriteString(pad + "  " + sFaint.Render("models · the first that can take a request gets it") + "\n")
-	for i, id := range g.Members {
+	hits := provider.PatternHits(g)
+	memFrom, memTo, ruleFrom, ruleTo := groupWindow(len(g.Members), len(g.Rules), m.gsel, m.groupRows(g, len(hits)))
+	for i := memFrom; i < memTo; i++ {
+		id := g.Members[i]
 		marker, name := "  ", sText.Render(id)
 		if i == m.gsel {
 			marker, name = sCursor.Render("▸ "), sNameOn.Render(id)
 		}
+		if g.IsFast(id) {
+			name += sMuted.Render(" · fast")
+		}
+		if slices.Contains(g.Matched, id) {
+			name += sMuted.Render(" · by pattern")
+		}
+		if m.memberOff(id) {
+			name += sMuted.Render(" · switched off: skipped until it is on again")
+		}
 		b.WriteString(pad + marker + sFaint.Render(fmt.Sprintf("%d  ", i+1)) + name + "\n")
 	}
-	b.WriteString("\n" + pad + "  " + sFaint.Render("rules · as a turn begins, the first that matches sends it to its model first") + "\n")
+	// patterns find models in the catalog each time (#766): how many now,
+	// and one that finds none said so rather than left an empty list
+	if len(hits) > 0 {
+		b.WriteString("\n" + pad + "  " + sFaint.Render("patterns · every model they match now, after those named") + "\n")
+		for _, h := range hits {
+			n := sMuted.Render(fmt.Sprintf(" · %d model%s", h.Models, plural(h.Models)))
+			if h.Models == 0 {
+				n = sBad.Render(" · matches nothing now")
+			}
+			b.WriteString(pad + "     " + sText.Render(h.Pattern) + n + "\n")
+		}
+	}
+	b.WriteString("\n" + pad + "  " + sFaint.Render("rules · as a turn begins, the first that matches sends it to its model first; a pause leaves its model out while it holds") + "\n")
 	if len(g.Rules) == 0 {
 		b.WriteString(pad + "  " + sMuted.Render("none · n adds one") + "\n")
 	}
-	for i, r := range g.Rules {
-		marker, use := "  ", sText.Render(r.Use)
+	for i := ruleFrom; i < ruleTo; i++ {
+		r := g.Rules[i]
+		uses := strings.Join(r.Uses(), ", ") // in order: the next when one can't take it
+		marker, use := "  ", sText.Render(uses)
 		if len(g.Members)+i == m.gsel {
-			marker, use = sCursor.Render("▸ "), sNameOn.Render(r.Use)
+			marker, use = sCursor.Render("▸ "), sNameOn.Render(uses)
 		}
-		b.WriteString(pad + marker + sFaint.Render(fmt.Sprintf("%d  ", i+1)) + sMuted.Render(strings.Join(r.Conditions(), " · ")+" → ") + use + "\n")
+		arrow := " → "
+		if r.Pause {
+			arrow = " → pause "
+		}
+		if r.UseEffort != "" {
+			use += sMuted.Render(" at ") + sText.Render(r.UseEffort)
+		}
+		b.WriteString(pad + marker + sFaint.Render(fmt.Sprintf("%d  ", i+1)) + sMuted.Render(strings.Join(r.Conditions(), " · ")+arrow) + use + "\n")
 	}
 	if slices.ContainsFunc(g.Rules, func(r provider.Rule) bool { return r.Intent != "" }) {
 		b.WriteString("\n" + pad + "  " + sFaint.Render("classifier ") + sText.Render(dash(g.Classifier)) + sFaint.Render(" · tells which intent a message is") + "\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// groupRows is how many members and rules the group page has room for:
+// the terminal's height less every other line View draws around them —
+// the header, the group's line, the section titles, the patterns, the
+// classifier, and the blank line, the status and the two lines of keys
+// under them, as a short group's page has. A group with
+// more than that would otherwise scroll its header and the row picked
+// off the top and freeze the page, as the library page did (#2220) and
+// the agents page before it (#2428).
+func (m model) groupRows(g provider.Group, hits int) int {
+	fixed := 7 + 6 // above the members and between them and the rules; below the body
+	if hits > 0 {
+		fixed += 2 + hits
+	}
+	if len(g.Rules) == 0 {
+		fixed++
+	}
+	if slices.ContainsFunc(g.Rules, func(r provider.Rule) bool { return r.Intent != "" }) {
+		fixed += 2
+	}
+	return max(3, m.h-fixed)
+}
+
+// groupWindow picks the members [memFrom, memTo) and rules [ruleFrom,
+// ruleTo) to draw in rows lines, the row picked among them: a pick among
+// the members keeps the first rules below it as room allows, a pick
+// among the rules keeps the members' tail above it. Members and rules
+// share one cursor, sel, the rules counted after the members.
+func groupWindow(members, rules, sel, rows int) (memFrom, memTo, ruleFrom, ruleTo int) {
+	if members+rules <= rows {
+		return 0, members, 0, rules
+	}
+	if sel < members {
+		memFrom = max(0, sel+1-rows)
+		memTo = min(members, memFrom+rows)
+		return memFrom, memTo, 0, min(rules, rows-(memTo-memFrom))
+	}
+	ruleTo = min(rules, sel-members+1)
+	ruleFrom = max(0, ruleTo-rows)
+	return max(0, members-(rows-(ruleTo-ruleFrom))), members, ruleFrom, ruleTo
 }

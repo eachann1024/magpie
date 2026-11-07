@@ -14,7 +14,8 @@ function fixture() {
     { ...base, id: "antigravity", name: "Antigravity", keyList: [], account: { agent: "antigravity", agentName: "Antigravity", user: logins[0].user, logins } },
     { ...base, id: "relay", name: "Relay", keyList: Array.from({ length: 5 }, (_, i) => ({ id: `key-${i + 1}`, name: `Key ${i + 1}`, masked: `test-key-${i + 1}`, active: i === 0, on: i !== 2 })) },
   ], presets: [], excluded: [], gateway: { running: false, window: true } };
-  const state = { agents: ["alpha", "beta", "gamma"].map(id => ({ id, name: id, icon: "generic", path: "/fixture", fields: [] })), profiles: [], settings: { lang: "en", theme: "light" } };
+  // Get started put away: under it a new user's agents are folded
+  const state = { agents: ["alpha", "beta", "gamma"].map(id => ({ id, name: id, icon: "generic", path: "/fixture", fields: [] })), profiles: [], settings: { lang: "en", theme: "light", guideHidden: true } };
   const f = { providers, state, posted: [], failNext: false };
   const items = p => p.account ? p.account.logins : p.keyList;
   const id = (p, item) => p.account ? item.user : item.id;
@@ -48,7 +49,8 @@ function fixture() {
         if (!first?.on) return json({ error: "turn this account on before moving it first" }, 400);
         arrange(p, body.accountOrder);
       }
-      if (url.pathname === "/api/provider/route") p.routing = body.routing;
+      // the editor's Routing is made with its Save
+      if (url.pathname === "/api/provider/save" && body.routing !== undefined) p.routing = body.routing;
       if (["/api/keys/use", "/api/login/switch"].includes(url.pathname)) {
         const first = body.ref || body.user;
         arrange(p, [first, ...items(p).map(item => id(p, item)).filter(ref => ref !== first)]);
@@ -66,9 +68,21 @@ function fixture() {
 const rows = page => page.locator(".accts [data-account-id]");
 const ids = page => rows(page).evaluateAll(rs => rs.map(r => r.dataset.accountId));
 const settled = page => page.waitForFunction(() => !accountArranging && !accountSaving);
+// drawn: the editor's rows as they stay. A signed-in provider's editor is
+// drawn at once and again when its accounts' allowances come in
+// (loginUsageOf), which replaces every row; a row held from the first draw
+// had no box by then (#4468, WebKit on a busy machine). It follows a
+// load, so its first draw has a load's room, not a click's (#4470).
+async function drawn(page) {
+  await rows(page).first().waitFor({ timeout: 60000 });
+  await page.waitForFunction(() => {
+    const agent = providers?.providers.find(p => p.id === editing)?.account?.agent;
+    return !agent || (loginUsage[agent]?.at && !loginUsage[agent].loading);
+  });
+}
 async function open(page, id) {
   await page.goto(`http://magpie.test/?view=providers&edit=${id}`);
-  await rows(page).first().waitFor();
+  await drawn(page);
 }
 async function point(row) {
   await row.scrollIntoViewIfNeeded();
@@ -103,26 +117,27 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     const context = await browser.newContext({ viewport: { width: 1000, height: 850 }, reducedMotion: "reduce", hasTouch: true });
     const page = await context.newPage(), f = fixture(), errors = [];
     page.setDefaultTimeout(5000);
+    page.setDefaultNavigationTimeout(60000);
     page.on("pageerror", e => errors.push(e.message));
     await page.route("**/*", f.route);
     for (const id of ["antigravity", "relay"]) {
       await open(page, id);
       for (const [mode, label] of [["", "Smart"], ["order", "In order"], ["rotate", "In turn"], ["usage", "Least used first"]]) {
-        // Smart may already be selected. The old routing value alone says
-        // nothing about whether its POST has finished redrawing the editor.
-        const oldFirst = await rows(page).first().elementHandle();
-        const routeResponse = page.waitForResponse(response =>
-          new URL(response.url()).pathname === "/api/provider/route" && response.request().method() === "POST");
+        // picked, then made with the editor's Save, which closes it
+        const saveResponse = page.waitForResponse(response =>
+          new URL(response.url()).pathname === "/api/provider/save" && response.request().method() === "POST");
         await page.locator(".editor .segs button", { hasText: new RegExp(`^${label}$`) }).click();
-        assert.equal((await routeResponse).status(), 200);
-        await page.waitForFunction(row => !row.isConnected, oldFirst);
+        await page.locator(".editor .bar button", { hasText: /^Save$/ }).click();
+        assert.equal((await saveResponse).status(), 200);
+        await page.waitForFunction(() => !document.querySelector(".editor"));
         assert.equal(f.providers.providers.find(p => p.id === id).routing, mode);
+        await open(page, id);
         const before = await ids(page), count = f.posted.filter(p => p.action === "/api/provider/arrange").length;
         await drag(page);
         assert.deepEqual(await ids(page), [before[1], before[0], ...before.slice(2)]);
         assert.equal(f.posted.filter(p => p.action === "/api/provider/arrange").length, count + 1);
         await checkFirst(page, f, id);
-        await page.reload(); await rows(page).first().waitFor();
+        await page.reload(); await drawn(page);
         await checkFirst(page, f, id);
         const wanted = (await ids(page))[1];
         await rows(page).nth(1).getByRole("button", { name: "Make first", exact: true }).click();

@@ -2,7 +2,10 @@ package library
 
 import (
 	"bytes"
+	"cmp"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"maps"
 	"os"
@@ -14,8 +17,9 @@ import (
 
 // Bundle is the library as a backup carries it to another computer: the
 // instruction sets and the one on, what each agent gets besides, the MCP
-// servers and the skills with their files. What magpie wrote into each
-// agent (Applied) is this computer's own and stays out. It is made the
+// servers, the skills with their files and the subagents. What magpie
+// wrote into each agent (Applied, the subagents' files among it) is this
+// computer's own and stays out. It is made the
 // same way every time — no times, everything in order — so two computers
 // with the same library carry the same bundle.
 type Bundle struct {
@@ -25,6 +29,14 @@ type Bundle struct {
 	MCP          []*Server         `json:"mcp"`
 	Skills       []*CarriedSkill   `json:"skills"`
 	Icons        map[string]string `json:"icons,omitempty"`
+	// Subagents are nil in a bundle from a magpie before they were
+	// carried, which knew nothing of this computer's: Put keeps them. Collect
+	// always sets it, empty too, so taking the last one out is carried.
+	Subagents *[]*Subagent `json:"subagents,omitempty"`
+	// Hooks are nil in a bundle from a magpie before they were carried,
+	// as Subagents are: Put keeps this computer's. Applied.Hooks, the
+	// entries magpie wrote into each agent here, stays out.
+	Hooks *[]*Hook `json:"hooks,omitempty"`
 }
 
 // CarriedSkill is a skill with its folder's files.
@@ -35,13 +47,20 @@ type CarriedSkill struct {
 	Files  map[string][]byte `json:"files"`          // by path in the folder, with /
 	Exec   []string          `json:"exec,omitempty"` // the files that run
 	Left   []string          `json:"left,omitempty"` // files too big to carry
+	// Called is the name its SKILL.md gives, when that isn't Name
+	Called string `json:"called,omitempty"`
+	// Note is the user's note on it (Skill.Note)
+	Note string `json:"note,omitempty"`
 }
 
-// A skill's file bigger than maxCarried is left out, and so is every file
-// once the skills come to maxCarriedAll: a backup is for text, not for
-// what a skill downloads beside it.
+// A skill's file bigger than maxCarried is left out, and so are the
+// biggest once the skills come to maxCarriedAll. A skill's own files go
+// with it, its scripts and its templates (a PowerPoint template with its
+// pictures is several MB), but a sync reads at most 64 MiB of a backup
+// (davsync), and a skill's bytes are base64 twice in one (the bundle's
+// JSON, then the sealed envelope's): 32 MiB of files is about 57 MiB.
 const (
-	maxCarried    = 2 << 20
+	maxCarried    = 16 << 20
 	maxCarriedAll = 32 << 20
 )
 
@@ -49,8 +68,10 @@ const (
 func Collect() (*Bundle, error) {
 	mu.Lock()
 	defer mu.Unlock()
-	if _, err := os.Stat(path()); err != nil {
+	if _, err := os.Stat(path()); errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
+	} else if err != nil { // there, but unknown: never carried as no library (#2269)
+		return nil, err
 	}
 	l, err := load()
 	if err != nil {
@@ -58,8 +79,14 @@ func Collect() (*Bundle, error) {
 	}
 	b := &Bundle{Instructions: l.Instructions, Texts: map[string]string{}, Extra: extras(), MCP: []*Server{}, Skills: []*CarriedSkill{}, Icons: l.Icons}
 	b.Instructions.Agents = orNone(b.Instructions.Agents)
+	// a set's own file is this computer's: its text goes, where it is
+	// doesn't
+	b.Instructions.Sets = slices.Clone(b.Instructions.Sets)
+	for i := range b.Instructions.Sets {
+		b.Instructions.Sets[i].File = ""
+	}
 	for _, s := range l.sets() {
-		if text := readText(setPath(s.ID)); text != "" {
+		if text := setText(l.textPath(s.ID)); text != "" {
 			b.Texts[s.ID] = text
 		}
 	}
@@ -69,17 +96,38 @@ func Collect() (*Bundle, error) {
 	if len(b.Extra) == 0 {
 		b.Extra = nil
 	}
-	for _, s := range sorted(l.MCP, func(s *Server) string { return s.Name }) {
-		c := *s
+	// a server kept to this computer stays out; another computer's by its
+	// name, which a sync brought, goes on as it came (mcp_local.go)
+	for _, s := range sorted(l.carriedServers(), func(s *Server) string { return s.Name }) {
+		c := *carried(s) // magpie's own by name, each computer's own binary
 		c.Agents = orNone(slices.Sorted(slices.Values(s.Agents)))
 		b.MCP = append(b.MCP, &c)
 	}
-	budget := maxCarriedAll
-	for _, s := range sorted(l.Skills, func(s *Skill) string { return s.Name }) {
-		c := readSkill(realDir(skillDir(s.Name)), &budget)
-		c.Name, c.Source, c.Agents = s.Name, s.Source, orNone(slices.Sorted(slices.Values(s.Agents)))
+	skills := sorted(l.Skills, func(s *Skill) string { return s.Name })
+	dirs := []string{}
+	for _, s := range skills {
+		dirs = append(dirs, realDir(skillDir(s.Name)))
+	}
+	for i, c := range readSkills(dirs) {
+		s := skills[i]
+		c.Name, c.Source, c.Agents, c.Called, c.Note = s.Name, s.Source, orNone(slices.Sorted(slices.Values(s.Agents))), s.Called, s.Note
 		b.Skills = append(b.Skills, c)
 	}
+	subs := []*Subagent{}
+	for _, s := range sorted(l.Subagents, func(s *Subagent) string { return s.Name }) {
+		c := *s
+		c.Skills, c.MCP = slices.Sorted(slices.Values(s.Skills)), slices.Sorted(slices.Values(s.MCP))
+		c.Agents = orNone(slices.Sorted(slices.Values(s.Agents)))
+		subs = append(subs, &c)
+	}
+	b.Subagents = &subs
+	hooks := []*Hook{}
+	for _, h := range sorted(l.Hooks, func(h *Hook) string { return h.Name }) {
+		c := *h
+		c.Agents = orNone(slices.Sorted(slices.Values(h.Agents)))
+		hooks = append(hooks, &c)
+	}
+	b.Hooks = &hooks
 	return b, nil
 }
 
@@ -94,50 +142,75 @@ func orNone(xs []string) []string {
 	return xs
 }
 
-// readSkill is a skill folder's files, as WalkDir gives them: in order.
-// Links in it, .git and what isn't a plain file stay out.
-func readSkill(dir string, budget *int) *CarriedSkill {
-	c := &CarriedSkill{Files: map[string][]byte{}}
-	filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if p != dir && (d.Name() == ".git" || d.Name() == marker) {
-				return filepath.SkipDir
+// readSkills is each skill folder's files. Links in it, .git and what
+// isn't a plain file stay out. What goes is chosen smallest first across
+// every skill, so the text of them all comes before any big file.
+func readSkills(dirs []string) []*CarriedSkill {
+	type file struct {
+		skill  int
+		rel, p string
+		size   int64
+		runs   bool
+	}
+	var files []file
+	out := make([]*CarriedSkill, len(dirs))
+	for i, dir := range dirs {
+		out[i] = &CarriedSkill{Files: map[string][]byte{}}
+		filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
 			}
+			if d.IsDir() {
+				if p != dir && (d.Name() == ".git" || d.Name() == marker) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !d.Type().IsRegular() || d.Name() == marker {
+				return nil
+			}
+			rel, err := filepath.Rel(dir, p)
+			if err != nil {
+				return nil
+			}
+			fi, err := d.Info()
+			if err != nil {
+				return nil
+			}
+			files = append(files, file{i, filepath.ToSlash(rel), p, fi.Size(), fi.Mode().Perm()&0o111 != 0})
 			return nil
-		}
-		if !d.Type().IsRegular() || d.Name() == marker {
-			return nil
-		}
-		rel, err := filepath.Rel(dir, p)
-		if err != nil {
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
-		fi, err := d.Info()
-		if err != nil {
-			return nil
-		}
-		if fi.Size() > maxCarried || int(fi.Size()) > *budget {
-			c.Left = append(c.Left, rel)
-			return nil
-		}
-		data, err := os.ReadFile(p)
-		if err != nil {
-			return nil
-		}
-		*budget -= len(data)
-		c.Files[rel] = data
-		if fi.Mode().Perm()&0o111 != 0 {
-			c.Exec = append(c.Exec, rel)
-		}
-		return nil
+		})
+	}
+	// smallest first, and the same order for the same files every time
+	slices.SortFunc(files, func(a, b file) int {
+		return cmp.Or(cmp.Compare(a.size, b.size), cmp.Compare(a.skill, b.skill), strings.Compare(a.rel, b.rel))
 	})
-	slices.Sort(c.Exec) // WalkDir's order isn't the order of the paths
-	slices.Sort(c.Left)
-	return c
+	budget := int64(maxCarriedAll)
+	for _, f := range files {
+		c := out[f.skill]
+		if f.size > maxCarried || f.size > budget {
+			c.Left = append(c.Left, f.rel)
+			continue
+		}
+		data, err := os.ReadFile(f.p)
+		if err != nil {
+			continue
+		}
+		if n := int64(len(data)); n > maxCarried || n > budget { // grew since
+			c.Left = append(c.Left, f.rel)
+			continue
+		}
+		budget -= int64(len(data))
+		c.Files[f.rel] = data
+		if f.runs {
+			c.Exec = append(c.Exec, f.rel)
+		}
+	}
+	for _, c := range out {
+		slices.Sort(c.Exec)
+		slices.Sort(c.Left)
+	}
+	return out
 }
 
 // check refuses a bundle that would write outside the library: a name
@@ -154,7 +227,7 @@ func (b *Bundle) check() error {
 		}
 	}
 	for id := range b.Extra {
-		if err := checkName("agent", id); err != nil {
+		if err := checkAgent(id); err != nil {
 			return err
 		}
 	}
@@ -178,10 +251,49 @@ func (b *Bundle) check() error {
 			return fmt.Errorf("the skill %s twice", s.Name)
 		}
 		seen[s.Name] = true
-		for rel := range s.Files {
+		for _, rel := range slices.Concat(slices.Collect(maps.Keys(s.Files)), s.Left) {
 			if !localFile(rel) {
 				return fmt.Errorf("skill %s: %q is not a file in its folder", s.Name, rel)
 			}
+		}
+	}
+	if b.Subagents != nil {
+		seen := map[string]bool{}
+		for _, s := range *b.Subagents {
+			if s == nil {
+				return fmt.Errorf("an empty subagent")
+			}
+			// the name is the file's in every agent's folder; the agents
+			// are left as they come, as a skill's are: one a newer magpie
+			// gives subagents to is no target here and gets nothing
+			if !subagentNameRe.MatchString(s.Name) || slices.Contains(reservedSubagents, s.Name) {
+				return fmt.Errorf("the subagent name %q", s.Name)
+			}
+			if seen[s.Name] {
+				return fmt.Errorf("the subagent %s twice", s.Name)
+			}
+			seen[s.Name] = true
+		}
+	}
+	if b.Hooks != nil {
+		seen := map[string]bool{}
+		for _, h := range *b.Hooks {
+			if h == nil {
+				return fmt.Errorf("an empty hook")
+			}
+			// the event and agents are left as they come: one a newer
+			// magpie knows and this one doesn't is a problem on the
+			// agent it is given to (syncHooks), not a refused library
+			if err := checkName("hook", h.Name); err != nil {
+				return err
+			}
+			if strings.TrimSpace(h.Command) == "" {
+				return fmt.Errorf("the hook %s has no command", h.Name)
+			}
+			if seen[h.Name] {
+				return fmt.Errorf("the hook %s twice", h.Name)
+			}
+			seen[h.Name] = true
 		}
 	}
 	return nil
@@ -200,6 +312,12 @@ func (b *Bundle) WithoutSecrets(secret func(string) bool) {
 	for i, s := range b.MCP {
 		c := *s
 		c.Env, c.Headers = blank(s.Env, secret), blank(s.Headers, secret)
+		// an OAuth app's secret is a key too; its client ID isn't
+		if s.OAuth != nil && s.OAuth.ClientSecret != "" {
+			a := *s.OAuth
+			a.ClientSecret = ""
+			c.OAuth = &a
+		}
 		b.MCP[i] = &c
 	}
 }
@@ -232,6 +350,12 @@ func (b *Bundle) WithSecrets(have *Bundle, secret func(string) bool) *Bundle {
 		i := slices.IndexFunc(have.MCP, func(h *Server) bool { return h.Name == s.Name })
 		if i >= 0 {
 			c.Env, c.Headers = filled(s.Env, have.MCP[i].Env, secret), filled(s.Headers, have.MCP[i].Headers, secret)
+			// the same app's secret, kept here
+			if h := have.MCP[i].OAuth; s.OAuth != nil && s.OAuth.ClientSecret == "" && h != nil && h.ClientID == s.OAuth.ClientID {
+				a := *s.OAuth
+				a.ClientSecret = h.ClientSecret
+				c.OAuth = &a
+			}
 		}
 		out.MCP = append(out.MCP, &c)
 	}
@@ -258,7 +382,9 @@ func filled(m, have map[string]string, secret func(string) bool) map[string]stri
 // replaced or taken out is kept with the backups, and so is an
 // instructions file that changes. A skill that comes linked to a folder
 // this computer has too is linked to it; else it comes as its files. A
-// skill whose files are as they are here is left alone.
+// skill whose files are as they are here is left alone. The subagents
+// replace the ones here too, unless b is from a magpie that didn't carry
+// them.
 func Put(b *Bundle) (*Result, error) {
 	if err := b.check(); err != nil {
 		return nil, err
@@ -276,8 +402,7 @@ func Put(b *Bundle) (*Result, error) {
 		keep, link := map[string]bool{}, map[string]string{}
 		for _, s := range b.Skills {
 			if cur := l.skill(s.Name); cur != nil && sameSource(cur.Source, s.Source) {
-				budget := maxCarriedAll
-				if have := readSkill(realDir(skillDir(s.Name)), &budget); sameFiles(have, s) {
+				if have := readSkills([]string{realDir(skillDir(s.Name))})[0]; sameFiles(have, s) {
 					keep[s.Name] = true
 					continue
 				}
@@ -293,6 +418,9 @@ func Put(b *Bundle) (*Result, error) {
 			if err := writeSkill(filepath.Join(stage, s.Name), s); err != nil {
 				return fmt.Errorf("skill %s: %w", s.Name, err)
 			}
+			if err := keepLeft(filepath.Join(stage, s.Name), realDir(skillDir(s.Name)), s); err != nil {
+				return fmt.Errorf("skill %s: %w", s.Name, err)
+			}
 		}
 
 		// every skill's files are ready: out with the old ones
@@ -303,7 +431,7 @@ func Put(b *Bundle) (*Result, error) {
 			if err != nil {
 				return nil
 			}
-			if fi.Mode()&fs.ModeSymlink != 0 {
+			if linkEntry(fi) {
 				return os.Remove(p) // a folder of the user's: only the link goes
 			}
 			if err := os.MkdirAll(aside, 0o700); err != nil {
@@ -320,7 +448,9 @@ func Put(b *Bundle) (*Result, error) {
 		}
 		skills := []*Skill{}
 		for _, s := range b.Skills {
-			skills = append(skills, &Skill{Name: s.Name, Source: s.Source, Agents: slices.Clone(orNone(s.Agents))})
+			// turned off here stays off here: that is this computer's own
+			off := l.skill(s.Name) != nil && l.skill(s.Name).OffHere
+			skills = append(skills, &Skill{Name: s.Name, Source: s.Source, Agents: slices.Clone(orNone(s.Agents)), OffHere: off, Called: s.Called, Note: s.Note})
 			if keep[s.Name] {
 				continue
 			}
@@ -328,7 +458,7 @@ func Put(b *Bundle) (*Result, error) {
 				return err
 			}
 			if dir, ok := link[s.Name]; ok {
-				if err := os.Symlink(dir, skillDir(s.Name)); err != nil {
+				if err := dirLink(dir, skillDir(s.Name)); err != nil {
 					if err := copyDir(dir, skillDir(s.Name)); err != nil {
 						return err
 					}
@@ -345,14 +475,24 @@ func Put(b *Bundle) (*Result, error) {
 		kept := newBackups()
 		l.kept = kept
 		texts := map[string]string{}
+		// a set linked here to a file of the user's keeps it: the file is
+		// given the text b has for the set, and never emptied for a text
+		// b hasn't
+		files := map[string]string{}
 		for _, s := range l.sets() {
-			texts[setPath(s.ID)] = ""
+			if s.File != "" {
+				files[s.ID] = s.File
+			} else {
+				texts[setPath(s.ID)] = ""
+			}
 		}
 		for id := range extras() {
 			texts[extraPath(id)] = ""
 		}
 		for id, text := range b.Texts {
-			texts[setPath(id)] = text
+			if files[id] == "" {
+				texts[setPath(id)] = text
+			}
 		}
 		for id, text := range b.Extra {
 			texts[extraPath(id)] = text
@@ -370,14 +510,40 @@ func Put(b *Bundle) (*Result, error) {
 		}
 		l.Instructions = Instructions{Agents: slices.Sorted(slices.Values(orNone(b.Instructions.Agents))),
 			Sets: slices.Clone(b.Instructions.Sets), Active: b.Instructions.Active}
-
-		l.MCP = nil
-		for _, s := range b.MCP {
-			c := *s
-			c.Agents = slices.Sorted(slices.Values(orNone(s.Agents)))
-			l.MCP = append(l.MCP, &c)
+		for i := range l.Instructions.Sets {
+			s := &l.Instructions.Sets[i]
+			s.File = files[s.ID]
+			if text := strings.TrimSpace(b.Texts[s.ID]); s.File != "" && text != "" {
+				if err := l.putText(s.File, text); err != nil {
+					return err
+				}
+			}
 		}
+
+		l.putServers(b.MCP)
 		l.Icons = maps.Clone(b.Icons)
+		// the agents are written on the sync change runs: what magpie
+		// wrote here (Applied) decides, file by file, what is its own
+		if b.Subagents != nil {
+			subs := []*Subagent{}
+			for _, s := range *b.Subagents {
+				c := *s
+				c.Skills, c.MCP, c.Agents = slices.Clone(s.Skills), slices.Clone(s.MCP), slices.Clone(orNone(s.Agents))
+				subs = append(subs, &c)
+			}
+			l.Subagents = subs
+		}
+		// the same for hooks: Applied.Hooks decides, entry by entry,
+		// what magpie takes out of each agent's file here
+		if b.Hooks != nil {
+			hooks := []*Hook{}
+			for _, h := range *b.Hooks {
+				c := *h
+				c.Agents = slices.Clone(orNone(h.Agents))
+				hooks = append(hooks, &c)
+			}
+			l.Hooks = hooks
+		}
 		return nil
 	})
 }
@@ -406,6 +572,40 @@ func writeSkill(dir string, s *CarriedSkill) error {
 			mode = 0o755
 		}
 		if err := os.WriteFile(p, s.Files[rel], mode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// keepLeft copies into a skill being put (at dir) the files the other
+// computer left out as too big to carry that the skill here has, so it
+// is put with them, not without.
+func keepLeft(dir, here string, s *CarriedSkill) error {
+	for _, rel := range s.Left {
+		if _, ok := s.Files[rel]; ok {
+			continue
+		}
+		from := filepath.Join(here, filepath.FromSlash(rel))
+		fi, err := os.Lstat(from)
+		if err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		to := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(to), 0o755); err != nil {
+			return err
+		}
+		in, err := os.Open(from)
+		if err != nil {
+			return err
+		}
+		out, err := os.OpenFile(to, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, fi.Mode().Perm())
+		if err == nil {
+			_, err = io.Copy(out, in)
+			err = errors.Join(err, out.Close())
+		}
+		in.Close()
+		if err != nil {
 			return err
 		}
 	}

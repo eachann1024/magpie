@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -70,9 +71,15 @@ func sse(lines ...string) string {
 }
 
 // setup points magpie's provider file at a temp dir and adds one provider
-// speaking only the given protocol, backed by the fake.
+// speaking only the given protocol, backed by the fake. Rests are kept
+// for the process, by provider id, and every test's provider is "fake":
+// one a test rested (out of its allowance, held without asking since
+// #1772) is lifted before and after it, or a later test's request would be
+// answered from it, its fake never asked (#1840).
 func setup(t *testing.T, proto provider.Protocol, f *fake) *httptest.Server {
 	t.Helper()
+	noRests()
+	t.Cleanup(noRests)
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	up := httptest.NewServer(f)
@@ -90,6 +97,14 @@ func setup(t *testing.T, proto provider.Protocol, f *fake) *httptest.Server {
 		t.Fatal(err)
 	}
 	return up
+}
+
+// noRests lifts every rest the package's tests have recorded.
+func noRests() {
+	restingUntil.Lock()
+	restingUntil.m = map[string]time.Time{}
+	restingUntil.note = map[string]Rest{}
+	restingUntil.Unlock()
 }
 
 func post(t *testing.T, path, body string) (int, string) {
@@ -113,6 +128,7 @@ func events(body string) []map[string]any {
 }
 
 type fallbackFake struct {
+	refusal       string // chat's, an English one when empty
 	chatBody      []byte
 	responsesBody []byte
 	chatCalls     int
@@ -127,6 +143,10 @@ func (f *fallbackFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.chatBody = body
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
+		if f.refusal != "" {
+			io.WriteString(w, f.refusal)
+			return
+		}
 		io.WriteString(w, `{"error":{"message":"This model is not supported in the v1/chat/completions endpoint. Use v1/responses."}}`)
 	case "/v1/responses":
 		f.responseCalls++
@@ -226,6 +246,52 @@ func TestChatClientFallsBackToResponses(t *testing.T) {
 	}
 }
 
+// agentRouterSaid is AgentRouter's word that a model is served on
+// /v1/responses, as #3766 quotes it.
+const agentRouterSaid = "模型 gpt-5.6-sol 不支持 /v1/chat/completions 接口，请改用 /v1/responses（OpenAI Responses API）。"
+
+// agentRouterRefusal is that word in an error body. The report has the
+// message only, so the JSON around it is a guess, and so is how it is
+// encoded: agentRouterEscaped has what isn't ASCII escaped, as Python's
+// json.dumps writes it (#1669).
+var (
+	agentRouterRefusal = `{"error":{"message":"` + agentRouterSaid + `","type":"invalid_request_error"}}`
+	agentRouterEscaped = `{"error":{"message":` + strconv.QuoteToASCII(agentRouterSaid) + `,"type":"invalid_request_error"}}`
+)
+
+// #3766 (char1eslu): AgentRouter turns its Responses-only models away on
+// /v1/chat/completions in Chinese, which wrongEndpoint didn't read, so a
+// provider with both URLs answered a Chat or a Messages client 400 though
+// /v1/responses serves the model. Both now get its reply from there.
+func TestChineseRefusalFallsBackToResponses(t *testing.T) {
+	for _, c := range []struct{ name, path, body, refusal string }{
+		{"chat", "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"hello"}]}`, agentRouterRefusal},
+		{"messages", "/v1/messages", `{"model":"m1","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}`, agentRouterRefusal},
+		{"chat, escaped", "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"hello"}]}`, agentRouterEscaped},
+		{"messages, escaped", "/v1/messages", `{"model":"m1","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}`, agentRouterEscaped},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			t.Setenv("XDG_CACHE_HOME", t.TempDir())
+			f := &fallbackFake{refusal: c.refusal}
+			up := httptest.NewServer(f)
+			t.Cleanup(up.Close)
+			if err := provider.Save(provider.Provider{ID: "agentrouter", Name: "AgentRouter", Key: "k", Models: []string{"m1"},
+				Chat: up.URL + "/v1", Responses: up.URL + "/v1"}); err != nil {
+				t.Fatal(err)
+			}
+			rec := httptest.NewRecorder()
+			New().Handler().ServeHTTP(rec, httptest.NewRequest("POST", c.path, strings.NewReader(c.body)))
+			if rec.Code != 200 || !strings.Contains(rec.Body.String(), "fallback ok") {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body)
+			}
+			if f.chatCalls != 1 || f.responseCalls != 1 {
+				t.Fatalf("calls: chat=%d responses=%d", f.chatCalls, f.responseCalls)
+			}
+		})
+	}
+}
+
 // The other way round: a model served only on /chat/completions (Copilot's
 // Claude models), asked for by a Responses client (Codex).
 func TestResponsesClientFallsBackToChat(t *testing.T) {
@@ -312,6 +378,51 @@ func TestAnthropicClientFallsBackPastOpenCodeFormats(t *testing.T) {
 	}
 }
 
+// Copilot's /v1/messages turns away a model it serves on chat completions
+// alone (GPT-4o, GPT-4.1) in plain text, "no model endpoints available
+// given user constraints": Claude Code's request goes on to chat
+// completions, where it is answered, not back to the user as a refusal of
+// their plan (#754).
+func TestAnthropicClientFallsBackPastCopilotNoEndpoints(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	calls := map[string]int{}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		calls[r.URL.Path]++
+		switch r.URL.Path {
+		case "/v1/messages":
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, "no model endpoints available given user constraints\n")
+		case "/v1/chat/completions":
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, sse(
+				`data: {"id":"c1","model":"gpt-4o","choices":[{"delta":{"role":"assistant","content":"chat ok"}}]}`,
+				`data: {"id":"c1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}`,
+				`data: [DONE]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(up.Close)
+	if err := provider.Save(provider.Provider{ID: "fake", Name: "Fake", Key: "k", Models: []string{"gpt-4o"},
+		Chat: up.URL + "/v1", Anthropic: up.URL}); err != nil {
+		t.Fatal(err)
+	}
+	handler := New().Handler()
+	for i, want := range []int{1, 2} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"gpt-4o","max_tokens":5,"messages":[{"role":"user","content":"."}]}`)))
+		if rec.Code != 200 || !strings.Contains(rec.Body.String(), "chat ok") {
+			t.Fatalf("call %d: status %d: %s", i, rec.Code, rec.Body.String())
+		}
+		if calls["/v1/messages"] != 1 || calls["/v1/chat/completions"] != want {
+			t.Fatalf("call %d: %v", i, calls)
+		}
+	}
+}
+
 func TestWrongEndpoint(t *testing.T) {
 	for _, tc := range []struct {
 		status int
@@ -324,6 +435,16 @@ func TestWrongEndpoint(t *testing.T) {
 		{400, `{"error":{"message":"model not accessible","code":"unsupported_api_for_model"}}`, true},
 		{400, `{"type":"error","error":{"type":"ModelError","message":"Model grok-4.7 is not supported for format anthropic"}}`, true},
 		{400, `{"type":"error","error":{"type":"invalid_request_error","message":"Model does not support this protocol."}}`, true},
+		{400, "no model endpoints available given user constraints\n", true}, // Copilot's /v1/messages (#754)
+		{400, toolsOnChatRefused, true}, // a relay (#1308)
+		{400, agentRouterRefusal, true}, // in Chinese (#3766)
+		{400, agentRouterEscaped, true}, // escaped (#1669)
+		{400, `{"error":{"message":"模型 gpt-5.6-sol 不支持 /v1/chat/completions 接口"}}`, true}, // its first clause alone
+		{400, `{"error":{"message":"请改用 /v1/responses（OpenAI Responses API）。"}}`, true},   // its second alone
+		// new-api's words for a model no channel serves (written from
+		// memory, not from the report): the model, not the API
+		{400, `{"error":{"message":"当前分组 default 下对于模型 gone 无可用渠道"}}`, false},
+		{400, `{"error":{"message":"The requested model is not supported.","code":"model_not_supported"}}`, false},
 		{429, `rate limit`, false},
 		{500, `use v1/responses`, false},
 		{200, `use v1/responses`, false},
@@ -564,8 +685,197 @@ func TestAnthropicPassthroughModelThatAlwaysThinks(t *testing.T) {
 	}
 }
 
+// DashScope's glm-5.3 cannot think with it off either, in its own words
+// ("The value of the enable_thinking parameter is restricted to True."):
+// the request magpie turned it off for is asked again with it left to the
+// model, once
+func TestAnthropicPassthroughDashScopeThinkingRestricted(t *testing.T) {
+	f := &fake{t: t, ctype: "application/json", reply: `{"id":"msg","type":"message","content":[]}`}
+	f.refuse = func(b []byte) (int, string) {
+		if bytes.Contains(b, []byte(`"disabled"`)) {
+			return 400, `{"error":{"code":"InternalError.Algo.InvalidParameter","message":"The value of the enable_thinking parameter is restricted to True.","type":"invalid_request_error"}}`
+		}
+		return 0, ""
+	}
+	setup(t, provider.Anthropic, f)
+	code, body := post(t, "/v1/messages", `{"model":"m1","max_tokens":5,"messages":[{"role":"user","content":"title?"}]}`)
+	if code != 200 || f.calls != 2 || bytes.Contains(f.got, []byte("thinking")) || !bytes.Contains(f.got, []byte(`"title?"`)) {
+		t.Fatalf("%d %s after %d calls, last sent %s", code, body, f.calls, f.got)
+	}
+	// another 400 is the agent's to see, not asked again
+	f.calls = 0
+	f.refuse = func([]byte) (int, string) { return 400, `{"type":"error","error":{"message":"bad request"}}` }
+	if code, _ := post(t, "/v1/messages", `{"model":"m1","max_tokens":5,"messages":[]}`); code != 400 || f.calls != 1 {
+		t.Errorf("%d after %d calls", code, f.calls)
+	}
+}
+
+// #699: ZCode's GLM-5.3-Flash refuses thinking turned off in Chinese
+// ("该模型始终支持思考，不可关闭"), which Pi's off sent and the agent got as
+// a 400: asked again with thinking left to the model, once
+func TestAnthropicPassthroughAlwaysThinksInChinese(t *testing.T) {
+	f := &fake{t: t, ctype: "application/json", reply: `{"id":"msg","type":"message","content":[]}`}
+	f.refuse = func(b []byte) (int, string) {
+		if bytes.Contains(b, []byte(`"disabled"`)) {
+			return 400, `{"type":"error","error":{"type":"invalid_request_error","message":"该模型始终支持思考，不可关闭"}}`
+		}
+		return 0, ""
+	}
+	setup(t, provider.Anthropic, f)
+	code, body := post(t, "/v1/messages", `{"model":"m1","max_tokens":5,"messages":[{"role":"user","content":"title?"}],"thinking":{"type":"disabled"}}`)
+	if code != 200 || f.calls != 2 || bytes.Contains(f.got, []byte("thinking")) || !bytes.Contains(f.got, []byte(`"title?"`)) {
+		t.Fatalf("%d %s after %d calls, last sent %s", code, body, f.calls, f.got)
+	}
+}
+
+// #1141: MiniMax and Volcengine Ark refuse thinking turned off in their
+// own words, the reporters' literal messages. The request magpie turned it
+// off for (Claude Desktop's model_validation probe, its health probe and
+// titles send none) is asked again with thinking left to the model, once;
+// thinking the caller asked for goes as it came, and another 400 on the
+// same request, or a near wording, is the caller's to see.
+func TestAnthropicPassthroughMiniMaxArkThinkingOffRefused(t *testing.T) {
+	for _, c := range []struct{ vendor, refusal string }{
+		{"MiniMax", `{"type":"error","error":{"type":"invalid_request_error","message":"invalid params, model \"MiniMax-M3.1-Flash-Preview\" requires adaptive thinking; thinking.type=\"disabled\" (including reasoning.effort=none) is not allowed (2013)"}}`},
+		{"Ark", `{"type":"error","error":{"type":"invalid_request_error","message":"thinking.type ` + "`disabled`" + ` is not supported by this model Request id: 021760000000000000000000000000000000000000000000000000"}}`},
+	} {
+		t.Run(c.vendor, func(t *testing.T) {
+			f := &fake{t: t, ctype: "application/json", reply: `{"id":"msg","type":"message","content":[]}`}
+			f.refuse = func(b []byte) (int, string) {
+				if bytes.Contains(b, []byte(`"disabled"`)) {
+					return 400, c.refusal
+				}
+				return 0, ""
+			}
+			setup(t, provider.Anthropic, f)
+			code, body := post(t, "/v1/messages", `{"model":"m1","max_tokens":1,"messages":[{"role":"user","content":[{"type":"text","text":"Hi","cache_control":{"type":"ephemeral"}}]}]}`)
+			if code != 200 || f.calls != 2 || bytes.Contains(f.got, []byte("thinking")) || !bytes.Contains(f.got, []byte(`"Hi"`)) {
+				t.Fatalf("omitted: %d %s after %d calls, last sent %s", code, body, f.calls, f.got)
+			}
+			f.calls = 0
+			if code, body := post(t, "/v1/messages", `{"model":"m1","max_tokens":1,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"."}]}`); code != 200 || f.calls != 1 || !bytes.Contains(f.got, []byte(`"thinking":{"type":"adaptive"}`)) {
+				t.Errorf("adaptive: %d %s after %d calls, sent %s", code, body, f.calls, f.got)
+			}
+			for _, other := range []string{
+				`{"type":"error","error":{"type":"invalid_request_error","message":"invalid params, max_tokens must be less than 8192 (2013)"}}`,
+				`{"type":"error","error":{"type":"invalid_request_error","message":"top_k is not supported by this model Request id: 0217"}}`,
+			} {
+				f.calls = 0
+				f.refuse = func([]byte) (int, string) { return 400, other }
+				if code, _ := post(t, "/v1/messages", `{"model":"m1","max_tokens":1,"messages":[{"role":"user","content":"."}]}`); code != 400 || f.calls != 1 {
+					t.Errorf("%s: %d after %d calls", other, code, f.calls)
+				}
+			}
+		})
+	}
+}
+
+// #3739: Kimi Code (China)'s K3.1 models refuse thinking turned off in
+// their own words, the reporter's literal message. The request magpie
+// turned it off for (ZCode sends none; it asks for a level as
+// output_config.effort) is asked again with thinking left to the model,
+// once; thinking the caller asked for goes as it came, and another 400 on
+// the same request, or a near wording, is the caller's to see.
+func TestAnthropicPassthroughKimiThinkingOffRefused(t *testing.T) {
+	const refusal = `{"type":"error","error":{"type":"invalid_request_error","message":"Kimi Code (China): K3.1 Pro does not support disabled thinking mode. Please enable thinking and try again, or choose another model."}}`
+	f := &fake{t: t, ctype: "application/json", reply: `{"id":"msg","type":"message","content":[]}`}
+	f.refuse = func(b []byte) (int, string) {
+		if bytes.Contains(b, []byte(`"disabled"`)) {
+			return 400, refusal
+		}
+		return 0, ""
+	}
+	setup(t, provider.Anthropic, f)
+	code, body := post(t, "/v1/messages", `{"model":"m1","max_tokens":1,"messages":[{"role":"user","content":[{"type":"text","text":"Hi","cache_control":{"type":"ephemeral"}}]}]}`)
+	if code != 200 || f.calls != 2 || bytes.Contains(f.got, []byte("thinking")) || !bytes.Contains(f.got, []byte(`"Hi"`)) {
+		t.Fatalf("omitted: %d %s after %d calls, last sent %s", code, body, f.calls, f.got)
+	}
+	f.calls = 0
+	if code, body := post(t, "/v1/messages", `{"model":"m1","max_tokens":1,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"."}]}`); code != 200 || f.calls != 1 || !bytes.Contains(f.got, []byte(`"thinking":{"type":"adaptive"}`)) {
+		t.Errorf("adaptive: %d %s after %d calls, sent %s", code, body, f.calls, f.got)
+	}
+	for _, other := range []string{
+		`{"type":"error","error":{"type":"invalid_request_error","message":"Kimi Code (China): max_tokens is too large"}}`,
+		`{"type":"error","error":{"type":"invalid_request_error","message":"Kimi Code (China): tool use is not supported by this model"}}`,
+	} {
+		f.calls = 0
+		f.refuse = func([]byte) (int, string) { return 400, other }
+		if code, _ := post(t, "/v1/messages", `{"model":"m1","max_tokens":1,"messages":[{"role":"user","content":"."}]}`); code != 400 || f.calls != 1 {
+			t.Errorf("%s: %d after %d calls", other, code, f.calls)
+		}
+	}
+}
+
+// The same refusal, escaped as \uXXXX the way a relay whose encoder
+// escapes what isn't ASCII sends it (#1669): asked again all the same.
+func TestAnthropicPassthroughAlwaysThinksInEscapedChinese(t *testing.T) {
+	f := &fake{t: t, ctype: "application/json", reply: `{"id":"msg","type":"message","content":[]}`}
+	f.refuse = func(b []byte) (int, string) {
+		if bytes.Contains(b, []byte(`"disabled"`)) {
+			return 400, `{"type":"error","error":{"type":"invalid_request_error","message":"\u8be5\u6a21\u578b\u59cb\u7ec8\u652f\u6301\u601d\u8003\uff0c\u4e0d\u53ef\u5173\u95ed"}}`
+		}
+		return 0, ""
+	}
+	setup(t, provider.Anthropic, f)
+	code, body := post(t, "/v1/messages", `{"model":"m1","max_tokens":5,"messages":[{"role":"user","content":"title?"}],"thinking":{"type":"disabled"}}`)
+	if code != 200 || f.calls != 2 || bytes.Contains(f.got, []byte("thinking")) || !bytes.Contains(f.got, []byte(`"title?"`)) {
+		t.Fatalf("%d %s after %d calls, last sent %s", code, body, f.calls, f.got)
+	}
+}
+
+func TestOpenRouterMandatoryReasoningRetries(t *testing.T) {
+	const refusal = `{"error":{"message":"OpenRouter: Reasoning is mandatory for this endpoint and cannot be disabled.","type":"invalid_request_error"},"type":"error"}`
+	for _, tc := range []struct {
+		name  string
+		proto provider.Protocol
+		path  string
+		body  string
+		calls int
+	}{
+		{"chat effort none", provider.Chat, "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"}`, 2},
+		{"chat enabled false", provider.Chat, "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"hi"}],"reasoning":{"enabled":false,"summary":"auto"}}`, 2},
+		{"chat reasoning effort none", provider.Chat, "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"none"}}`, 2},
+		{"anthropic explicit disabled", provider.Anthropic, "/v1/messages", `{"model":"m1","max_tokens":5,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}`, 2},
+		{"anthropic omitted", provider.Anthropic, "/v1/messages", `{"model":"m1","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}`, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fake{t: t, ctype: "application/json", reply: `{"id":"ok","choices":[],"content":[]}`}
+			f.refuse = func(b []byte) (int, string) {
+				var q map[string]json.RawMessage
+				if json.Unmarshal(b, &q) != nil {
+					t.Fatalf("invalid upstream body: %s", b)
+				}
+				if tc.proto == provider.Chat && hasReasoningDisabled(b) || tc.proto == provider.Anthropic && bytes.Contains(q["thinking"], []byte(`"disabled"`)) {
+					return 400, refusal
+				}
+				return 0, ""
+			}
+			setup(t, tc.proto, f)
+			p, err := provider.Find("fake")
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.Preset = "openrouter"
+			if err := provider.Save(*p); err != nil {
+				t.Fatal(err)
+			}
+			code, body := post(t, tc.path, tc.body)
+			if code != 200 || f.calls != tc.calls {
+				t.Fatalf("%d %s after %d calls, last sent %s", code, body, f.calls, f.got)
+			}
+			if tc.proto == provider.Chat && hasReasoningDisabled(f.got) || tc.proto == provider.Anthropic && bytes.Contains(f.got, []byte(`"disabled"`)) {
+				t.Fatalf("retry still disables reasoning: %s", f.got)
+			}
+			if tc.name == "chat enabled false" && !bytes.Contains(f.got, []byte(`"summary":"auto"`)) {
+				t.Fatalf("retry dropped unrelated reasoning setting: %s", f.got)
+			}
+		})
+	}
+}
+
 // Qoder asks "none" for its permission checks, which Command Code turns
-// away with the levels it takes: asked again at the lowest, once
+// away with the levels it takes: asked again at the lowest, and at the
+// lowest from then on
 func TestPassthroughEffortNoneRefused(t *testing.T) {
 	f := &fake{t: t, ctype: "application/json", reply: `{"id":"c1","choices":[]}`}
 	f.refuse = func(b []byte) (int, string) {
@@ -575,15 +885,77 @@ func TestPassthroughEffortNoneRefused(t *testing.T) {
 		return 0, ""
 	}
 	setup(t, provider.Chat, f)
-	code, body := post(t, "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"ok?"}],"reasoning_effort":"none"}`)
-	if code != 200 || f.calls != 2 || !bytes.Contains(f.got, []byte(`"reasoning_effort":"low"`)) || !bytes.Contains(f.got, []byte(`"ok?"`)) {
-		t.Fatalf("%d %s after %d calls, last sent %s", code, body, f.calls, f.got)
+	srv := New()
+	for turn, calls := range []int{2, 1} {
+		f.calls = 0
+		code, body := postTo(t, srv, "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"ok?"}],"reasoning_effort":"none"}`)
+		if code != 200 || f.calls != calls || !bytes.Contains(f.got, []byte(`"reasoning_effort":"low"`)) || !bytes.Contains(f.got, []byte(`"ok?"`)) {
+			t.Fatalf("turn %d: %d %s after %d calls, last sent %s", turn+1, code, body, f.calls, f.got)
+		}
+	}
+	// the levels named mark reasoning off as a whole: minimal, never
+	// refused itself, goes at low too
+	f.calls = 0
+	if code, body := postTo(t, srv, "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"ok?"}],"reasoning_effort":"minimal"}`); code != 200 || f.calls != 1 || !bytes.Contains(f.got, []byte(`"reasoning_effort":"low"`)) {
+		t.Fatalf("minimal: %d %s after %d calls, last sent %s", code, body, f.calls, f.got)
 	}
 	// another 400 is the agent's to see
 	f.calls = 0
 	f.refuse = func([]byte) (int, string) { return 400, `{"error":{"message":"bad request"}}` }
 	if code, _ := post(t, "/v1/chat/completions", `{"model":"m1","messages":[],"reasoning_effort":"none"}`); code != 400 || f.calls != 1 {
 		t.Errorf("%d after %d calls", code, f.calls)
+	}
+}
+
+// minimal refused with none among the levels taken, as OpenAI does for
+// gpt-5.1: minimal goes at low from then on, and none still goes as sent.
+// The error is OpenAI's wording as published for gpt-5.1, reconstructed,
+// not captured.
+func TestPassthroughMinimalRefusedNoneTaken(t *testing.T) {
+	for _, c := range []struct {
+		proto      provider.Protocol
+		path, body string
+	}{
+		{provider.Chat, "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"ok?"}],"reasoning_effort":%q}`},
+		{provider.Responses, "/v1/responses", `{"model":"m1","input":"ok?","reasoning":{"effort":%q}}`},
+	} {
+		f := &fake{t: t, ctype: "application/json", reply: `{"id":"c1","choices":[]}`}
+		f.refuse = func(b []byte) (int, string) {
+			if bytes.Contains(b, []byte(`"minimal"`)) {
+				return 400, `{"error":{"message":"Unsupported value: 'minimal' is not supported with the 'gpt-5.1' model. Supported values are: 'none', 'low', 'medium', and 'high'.","type":"invalid_request_error","param":"reasoning.effort","code":"unsupported_value"}}`
+			}
+			return 0, ""
+		}
+		setup(t, c.proto, f)
+		srv := New()
+		for i, turn := range []struct {
+			effort, sent string
+			calls        int
+		}{{"minimal", "low", 2}, {"minimal", "low", 1}, {"none", "none", 1}} {
+			f.calls = 0
+			code, body := postTo(t, srv, c.path, fmt.Sprintf(c.body, turn.effort))
+			if code != 200 || f.calls != turn.calls || bodyEffort(c.proto, f.got) != turn.sent {
+				t.Fatalf("%s turn %d at %s: %d %s after %d calls, last sent %s", c.proto, i+1, turn.effort, code, body, f.calls, f.got)
+			}
+		}
+	}
+}
+
+// the other level of reasoning off counts as taken only where an error
+// lists it quoted, in JSON's escaped quotes too, not as a word in a sentence
+func TestOtherOffNamed(t *testing.T) {
+	for _, c := range []struct {
+		effort, body string
+		want         bool
+	}{
+		{"minimal", `{"error":{"message":"Unsupported value: 'minimal' is not supported with the 'gpt-5.1' model. Supported values are: 'none', 'low', 'medium', and 'high'."}}`, true},
+		{"none", `{"error":{"message":"Invalid option: expected one of \"minimal\"|\"low\"|\"high\""}}`, true},
+		{"minimal", `{"error":{"message":"Invalid option: expected one of \"none\"|\"low\"|\"high\""}}`, true},
+		{"minimal", `{"error":{"message":"Invalid option: expected one of \"low\"|\"medium\"|\"high\". None of these is minimal."}}`, false},
+	} {
+		if got := otherOffNamed[c.effort].MatchString(c.body); got != c.want {
+			t.Errorf("otherOffNamed[%s] on %s = %v", c.effort, c.body, got)
+		}
 	}
 }
 
@@ -685,15 +1057,23 @@ func TestModelsListReasoning(t *testing.T) {
 			Levels    []struct {
 				Effort string `json:"effort"`
 			} `json:"supported_reasoning_levels"`
+			Flat *[]string `json:"reasoning_levels"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
 	want := map[string]string{
-		"a/sol": "low,medium,high,max", "b/sol": "medium,high", "group/auto-sol": "medium,high",
-		"a/mixed": "low,high", "b/mixed": "", "group/auto-mixed": "", "a/plain": "",
+		"a/sol": "low,medium,high,max", "b/sol": "medium,high", "auto/sol": "medium,high",
+		"a/mixed": "low,high", "b/mixed": "", "auto/mixed": "low,high", "a/plain": "",
 	}
+	// a group reasons when any member does: b/mixed has no levels and a
+	// list that says nothing of reasoning, but a/mixed does, so the group
+	// is told to reason (#756's rule for images, applied to reasoning),
+	// at a/mixed's levels: b/mixed is sent no reasoning ask (quiet.go), so
+	// it doesn't take them away (#2127: Codex showed no effort control for
+	// a group with none, and ran it at medium)
+	reasoning := map[string]bool{"auto/mixed": true}
 	for _, m := range response.Data {
 		expected, ok := want[m.ID]
 		if !ok {
@@ -704,12 +1084,24 @@ func TestModelsListReasoning(t *testing.T) {
 		for _, level := range m.Levels {
 			levels = append(levels, level.Effort)
 		}
-		if m.Reasoning == nil || *m.Reasoning != (expected != "") || strings.Join(levels, ",") != expected {
+		if m.Reasoning == nil || *m.Reasoning != (expected != "" || reasoning[m.ID]) || strings.Join(levels, ",") != expected {
 			t.Errorf("%s: reasoning %v, levels %v; want %q", m.ID, m.Reasoning, levels, expected)
+		}
+		// the same levels as plain names, in the same order, for clients
+		// of the Catwalk schema (#2576): [] when there are none, never
+		// null or missing, which such a client reads as "takes no effort"
+		if m.Flat == nil || *m.Flat == nil || strings.Join(*m.Flat, ",") != expected {
+			t.Errorf("%s: reasoning_levels %v; want [%s]", m.ID, m.Flat, expected)
 		}
 	}
 	if len(want) > 0 {
 		t.Errorf("missing models: %v", want)
+	}
+	// one model asked for by its id says them too
+	rec = httptest.NewRecorder()
+	New().Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models/b/sol", nil))
+	if one := rec.Body.String(); !strings.Contains(one, `"reasoning_levels":["medium","high"]`) {
+		t.Errorf("/v1/models/b/sol: %s; want reasoning_levels [medium high]", one)
 	}
 }
 
@@ -797,6 +1189,7 @@ func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
 func TestCodexAccountUpstream(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	claims := func(m map[string]any) string {
@@ -1008,10 +1401,12 @@ func TestOpenCodeGetsConversationSession(t *testing.T) {
 		}
 		return f.head.Get("x-opencode-session")
 	}
-	if got := send(http.Header{"Session_id": {"codex-ses"}}); got != "codex-ses" {
-		t.Errorf("agent's session: %q", got)
+	// in OpenCode's form (ses_…), one for each of the agent's sessions
+	codex := send(http.Header{"Session_id": {"codex-ses"}})
+	if !strings.HasPrefix(codex, "ses_") || send(http.Header{"Session_id": {"codex-ses"}}) != codex {
+		t.Errorf("agent's session: %q", codex)
 	}
-	if a, b := send(nil), send(nil); a == "" || a != b {
+	if a, b := send(nil), send(nil); !strings.HasPrefix(a, "ses_") || a != b || a == codex {
 		t.Errorf("derived session: %q %q", a, b)
 	}
 }
@@ -1210,7 +1605,7 @@ func TestRequestValidationBeforeRouting(t *testing.T) {
 }
 
 func TestGeminiRequestValidation(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setHome(t, t.TempDir())
 	f := &fake{t: t, reply: sse(
 		`data: {"id":"c1","choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}`,
 		`data: [DONE]`)}
@@ -1236,7 +1631,7 @@ func TestGeminiRequestValidation(t *testing.T) {
 }
 
 func TestRequestValidationPreservesPayload(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setHome(t, t.TempDir())
 	f := &fake{t: t, ctype: "application/json", reply: `{"id":"r1","output":[]}`}
 	setup(t, provider.Responses, f)
 	code, body := post(t, "/v1/responses", `{"model":"  fake/vendor/new-model  ","input":"hi","extension":{"number":9007199254740993}}`)

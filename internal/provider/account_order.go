@@ -4,11 +4,16 @@ import "fmt"
 
 // SetAccountOrder changes the order used by routing, not just its presentation.
 // The first enabled account becomes first through the same switch used by Make
-// first. Disabled accounts can be moved, but never silently enabled by a drag.
+// first, unless the agent is kept signed in to another (KeepLoginAs). Disabled accounts can be moved, but never silently enabled by a drag.
 func SetAccountOrder(id string, order []string) error {
 	p, err := Find(id)
 	if err != nil {
 		return err
+	}
+	if p.IsPlugin() {
+		// a plugin's accounts are listed and switched by the provider's id,
+		// and kept in logins.json as plugin:<its id>
+		return arrangeLoginsAs(p.ID, pluginAgent(*p.Account.plugin), order)
 	}
 	if p.Account != nil {
 		return arrangeLogins(p.Account.Agent, order)
@@ -39,6 +44,12 @@ func SetAccountOrder(id string, order []string) error {
 }
 
 func arrangeLogins(agent string, order []string) error {
+	return arrangeLoginsAs(agent, agent, order)
+}
+
+// arrangeLoginsAs arranges the accounts agent lists and switches, saved in
+// logins.json under stored.
+func arrangeLoginsAs(agent, stored string, order []string) error {
 	var available []string
 	var first Login
 	for _, l := range Logins(agent) {
@@ -64,7 +75,7 @@ func arrangeLogins(agent string, order []string) error {
 		rank[user] = i + 1
 	}
 	for i := range ls {
-		if ls[i].Agent == agent {
+		if ls[i].Agent == stored {
 			before[ls[i].User] = ls[i].Order
 			ls[i].Order = rank[ls[i].User]
 		}
@@ -77,7 +88,9 @@ func arrangeLogins(agent string, order []string) error {
 	}
 	err := writeLogins(ls)
 	loginsMu.Unlock()
-	if err != nil || first.Active {
+	// kept signed in to an account of the user's choosing, the order is
+	// the gateway's alone: the sign-in stays (#524)
+	if err != nil || first.Active || keptAs(agent) != "" {
 		return err
 	}
 	if err = SwitchLogin(agent, order[0]); err == nil {
@@ -86,7 +99,7 @@ func arrangeLogins(agent string, order []string) error {
 	loginsMu.Lock()
 	ls = readLogins()
 	for i := range ls {
-		if ls[i].Agent == agent {
+		if ls[i].Agent == stored {
 			ls[i].Order = before[ls[i].User]
 		}
 	}

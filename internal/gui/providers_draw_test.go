@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -14,6 +15,7 @@ import (
 // editor to list apart from the models agents chat with.
 func TestProviderInfoListsImageModels(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -28,8 +30,8 @@ func TestProviderInfoListsImageModels(t *testing.T) {
 		t.Fatal(err)
 	}
 	j := providerInfo(p, nil)
-	if got := strings.Join(j.DrawIDs, ","); got != "gpt-image-2,flux-kontext-pro" || j.Draws != 2 {
-		t.Fatalf("drawIds %q draws %d", got, j.Draws)
+	if got := strings.Join(j.DrawIDs, ","); got != "gpt-image-2,flux-kontext-pro" || j.Draws != 2 || j.DrawPicks {
+		t.Fatalf("drawIds %q draws %d, vendor picks %v", got, j.Draws, j.DrawPicks)
 	}
 	for _, m := range j.Models {
 		if m.ID != "gpt-5.5" {

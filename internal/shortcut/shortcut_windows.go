@@ -5,37 +5,53 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	ole "github.com/go-ole/go-ole"
 	"github.com/go-ole/go-ole/oleutil"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
+
+	"github.com/yetone/magpie/internal/appdir"
 )
 
 // appPath is where Win+R and `start magpie` look magpie.exe up: the user's
 // own, no administrator needed
 const appPath = `Software\Microsoft\Windows\CurrentVersion\App Paths\magpie.exe`
 
-func ensure(exe string) error {
+func registerAppPath(exe string) {
 	if k, _, err := registry.CreateKey(registry.CURRENT_USER, appPath, registry.SET_VALUE); err == nil {
 		_ = k.SetStringValue("", exe)
 		_ = k.SetStringValue("Path", filepath.Dir(exe))
 		k.Close()
 	}
+}
+
+func registeredAppPath() bool {
+	k, err := registry.OpenKey(registry.CURRENT_USER, appPath, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	k.Close()
+	return true
+}
+
+func startMenuLink() (string, error) {
 	dir, err := programs()
 	if err != nil {
-		return err
+		return "", err
 	}
-	_, err = write(filepath.Join(dir, Name+".lnk"), exe)
-	return err
+	return filepath.Join(dir, Name+".lnk"), nil
 }
+
+func writeShortcut(lnk, exe string) (bool, error) { return write(lnk, exe) }
 
 // programs is the user's Start menu Programs folder.
 func programs() (string, error) {
 	if p, err := windows.KnownFolderPath(windows.FOLDERID_Programs, windows.KF_FLAG_CREATE); err == nil && p != "" {
 		return p, nil
 	}
-	a := os.Getenv("APPDATA")
+	a := appdir.Getenv("APPDATA")
 	if a == "" {
 		return "", errors.New("no Start menu folder")
 	}
@@ -105,4 +121,21 @@ func write(lnk, exe string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// unregisterAppPath takes magpie's App Paths entry out while it opens exe,
+// or an exe that is gone.
+func unregisterAppPath(exe string) error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, appPath, registry.QUERY_VALUE)
+	if err != nil {
+		return nil // none
+	}
+	v, _, err := k.GetStringValue("")
+	k.Close()
+	if err == nil && v != "" && !strings.EqualFold(filepath.Clean(v), filepath.Clean(exe)) {
+		if _, err := os.Stat(v); err == nil {
+			return nil // another magpie's
+		}
+	}
+	return registry.DeleteKey(registry.CURRENT_USER, appPath)
 }

@@ -9,11 +9,17 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/iconproxy"
+	"github.com/yetone/magpie/internal/netguard"
 )
 
 // A provider's own picture lives in the icons folder beside providers.json,
@@ -67,31 +73,108 @@ func StoreIcon(data []byte) (string, error) {
 // user confirms the import, never at parse time; the URL is re-checked here
 // so a crafted request can't point magpie at anything but a public https
 // picture, and the read stops one byte past MaxIcon so a huge body is
-// refused rather than buffered.
+// refused rather than buffered. The picture is asked for through
+// usemagpie.ai's icon proxy, so its host never sees the user's IP.
 func FetchIcon(ctx context.Context, rawURL string) (string, error) {
 	u, err := iconURL(rawURL)
 	if err != nil {
 		return "", err
 	}
-	return fetchIcon(ctx, guardClient(), u)
+	c := iconClient()
+	// the client is this fetch's alone: the connection it made, left idle
+	// in the transport's pool, is dropped by nobody else (#4824)
+	defer c.CloseIdleConnections()
+	return fetchIcon(ctx, c, iconproxy.URL(u))
 }
+
+// iconClient is the client FetchIcon uses; tests point it at a local proxy.
+var iconClient = guardClient
 
 // guardClient is the http.Client icon fetches use: the default transport —
 // so the proxy settings still apply — but with dialing wrapped in publicDial.
+//
+// Through a proxy the connection goes to the proxy, often on this computer
+// (Clash's 127.0.0.1:7890), so the proxy's own address is dialed as it is;
+// the site's name is judged before the proxy is asked for, since the proxy
+// resolves it where magpie can't see.
 func guardClient() *http.Client {
 	c := *http.DefaultClient
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	dial := t.DialContext
+	var proxies sync.Map // host:port of the proxies this client was sent to
+	if proxy := t.Proxy; proxy != nil {
+		t.Proxy = func(req *http.Request) (*url.URL, error) {
+			u, err := proxy(req)
+			if err != nil || u == nil {
+				return u, err
+			}
+			if err := publicHost(req.Context(), req.URL.Hostname()); err != nil {
+				return nil, err
+			}
+			proxies.Store(proxyAddr(u), true)
+			return u, nil
+		}
+	}
 	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if _, ok := proxies.Load(addr); ok {
+			return dial(ctx, network, addr)
+		}
 		return publicDial(ctx, dial, network, addr)
 	}
 	c.Transport = t
 	return &c
 }
 
+// publicHost checks a site's answers with the same rules as publicDial,
+// for a fetch the proxy will make. A name that doesn't resolve
+// here is left to the proxy, which may be the only way to reach it.
+func publicHost(ctx context.Context, host string) error {
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil
+	}
+	_, err = iconIPs(host, ips)
+	return err
+}
+
+// iconIPs is ips without the AAAA records Loon synthesizes for an A
+// answer beside them (netguard.LoonPaired; that A answer is judged in
+// their place), or an error when any other is not public.
+func iconIPs(host string, ips []net.IPAddr) ([]net.IPAddr, error) {
+	all := make([]netip.Addr, len(ips))
+	for i, ip := range ips {
+		all[i], _ = netip.AddrFromSlice(ip.IP)
+	}
+	var allowed []net.IPAddr
+	for i, ip := range ips {
+		if publicIP(ip.IP) {
+			allowed = append(allowed, ip)
+			continue
+		}
+		if netguard.LoonPaired(all[i].Unmap(), all) {
+			continue
+		}
+		return nil, errorf("the icon host %s resolves to %s, which is not public", host, ip.IP)
+	}
+	return allowed, nil
+}
+
+// proxyAddr is the host:port the transport dials to reach proxy u.
+func proxyAddr(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		port = map[string]string{"https": "443", "socks5": "1080", "socks5h": "1080"}[u.Scheme]
+		if port == "" {
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(u.Hostname(), port)
+}
+
 // publicDial resolves the host and refuses to connect when any address it
-// maps to is not public. Checking the resolved address here, not just the
-// URL's hostname, closes the door on a name that answers public once and
+// maps to is not public (except a paired Loon AAAA discarded by iconIPs).
+// Checking the resolved address here, not just the URL's hostname, closes
+// the door on a name that answers public once and
 // private the next time (DNS rebinding): the same resolution this dial uses
 // is the one that is judged.
 func publicDial(ctx context.Context, dial func(context.Context, string, string) (net.Conn, error), network, addr string) (net.Conn, error) {
@@ -106,10 +189,9 @@ func publicDial(ctx context.Context, dial func(context.Context, string, string) 
 	if len(ips) == 0 {
 		return nil, errorf("could not resolve %s", host)
 	}
-	for _, ip := range ips {
-		if !publicIP(ip.IP) {
-			return nil, errorf("the icon host %s resolves to %s, which is not public", host, ip.IP)
-		}
+	ips, err = iconIPs(host, ips)
+	if err != nil {
+		return nil, err
 	}
 	// Dial each resolved address by IP, so nothing resolves twice.
 	var lastErr error
@@ -123,44 +205,17 @@ func publicDial(ctx context.Context, dial func(context.Context, string, string) 
 	return nil, lastErr
 }
 
-// publicIP is true for an address on the open internet: not loopback,
-// private, link-local, unspecified, multicast or otherwise reserved.
+// publicIP is true for an address an icon may be fetched from: one on the
+// open internet (netguard.Public, the gateway's rule), or a fake-IP
+// resolver's answer in 198.18.0.0/15 (netguard.FakeIP): Clash's TUN mode
+// with fake-ip and Surge's enhanced mode answer every name with an
+// address there and carry the connection to the real host through the
+// proxy (#252). No machine on the user's network sits in that range, so a
+// fetch aimed at it reaches the internet host the name stands for, not
+// this computer or the LAN.
 func publicIP(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
-		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
-		return false
-	}
-	if v4 := ip.To4(); v4 != nil {
-		// 100.64/10 carrier NAT, 192.0.0.0/24, 192.0.2/24, 198.18/15 and
-		// friends: never a public web host.
-		switch {
-		case v4[0] == 100 && v4[1]&0xc0 == 64:
-			return false
-		case v4[0] == 192 && v4[1] == 0 && v4[2] == 0:
-			return false
-		case v4[0] == 192 && v4[1] == 0 && v4[2] == 2:
-			return false
-		case v4[0] == 198 && (v4[1] == 18 || v4[1] == 19):
-			return false
-		case v4[0] == 198 && v4[1] == 51 && v4[2] == 100:
-			return false
-		case v4[0] == 203 && v4[1] == 0 && v4[2] == 113:
-			return false
-		}
-		return true
-	}
-	// IPv6: unique local (fc00::/7) and 6to4/teredo tunnels are not public
-	// web hosts either.
-	if len(ip) == net.IPv6len {
-		if ip[0]&0xfe == 0xfc {
-			return false
-		}
-		if ip[0] == 0x20 && ip[1] == 0x02 {
-			return false // 2002::/16 6to4
-		}
-	}
-	return true
+	a, ok := netip.AddrFromSlice(ip)
+	return ok && (netguard.Public(a) || netguard.FakeIP(a))
 }
 
 // fetchIcon is the download itself, split out so tests can point it at a
@@ -225,14 +280,22 @@ func iconExt(b []byte) string {
 	return ""
 }
 
-// pruneIcons removes pictures no provider points at any more. One picked in
-// the editor is stored before its provider is saved, so a fresh one stays.
+// pruneIcons removes pictures no provider points at any more, nor a plugin
+// gave its provider (PluginIcon), nor a partner listed now shows. One
+// picked in the editor is stored before its provider is saved, so a fresh
+// one stays.
 func pruneIcons(f file) {
 	used := map[string]bool{}
 	for _, p := range f.Providers {
 		if name, ok := strings.CutPrefix(p.Icon, iconPrefix); ok {
 			used[name] = true
 		}
+	}
+	for _, name := range keptPluginIcons() {
+		used[name] = true
+	}
+	for _, name := range keptPartnerIcons() {
+		used[name] = true
 	}
 	ents, _ := os.ReadDir(IconDir())
 	for _, e := range ents {
@@ -243,4 +306,5 @@ func pruneIcons(f file) {
 			os.Remove(filepath.Join(IconDir(), e.Name()))
 		}
 	}
+	pruneSmallIcons()
 }

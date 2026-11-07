@@ -1,29 +1,29 @@
 package provider
 
-// A ZCode subscription is Z.ai's GLM Coding Plan, which ZCode (Zhipu's
-// desktop app) signs in to. The plan is served on an Anthropic-compatible
-// endpoint to a plain API key, `<id>.<secret>`, that ZCode mints for the
-// account and names zcode-api-key; magpie uses that key as ZCode does.
-//
+// PLUGIN-SERVED (see AGENTS.md): ZCode ("zcode") is a retired built-in
+// subscription, served by its plugin alone,
+// @magpie-community/opencode-zcode-auth (provider.BuiltinRetired). Its
+// sign-in, models, requests and usage are the plugin's; what is left here
+// is reading the accounts signed in to the built-in and ZCode's own one,
+// for the move onto the plugin (migrate_zcode.go) and the plugin's own
+// account (zcodeOwn), and the Zhipu plan readers a GLM Coding Plan key's
+// card still uses (planquota.go). A fix belongs in the plugin
+// (github.com/magpie-community/plugins, packages/zcode), with the mover's
+// min raised in internal/provider/migrate_zcode.go.
+
 // ZCode's own account is read, never changed, from its credential store,
 // ~/.zcode/v2/credentials.json: each value is "enc:v1:" + iv.tag.ciphertext
 // (base64url), AES-256-GCM under sha256 of $ZCODE_CREDENTIAL_SECRET, or
-// else of "zcode-credential-fallback:<platform>:<home>:<user>". Further
-// accounts are signed in by magpie with ZCode's own polling sign-in
-// (zcode.z.ai/api/v1/oauth/cli/…), and their key is kept in logins.json.
-//
-// The plan's models are ZCode's, as its built-in config lists them for the
-// coding plan (zcode_models.go); zcodeModels are them before that is read.
+// else of "zcode-credential-fallback:<platform>:<home>:<user>". The
+// accounts magpie signed in to keep their key in logins.json.
 
 import (
 	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,7 +38,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/appdir"
 )
 
 // Where ZCode's coding plan and its sign-in are; vars so tests can point
@@ -48,29 +48,35 @@ var (
 	ZCodeBigModelBase = "https://open.bigmodel.cn/api/anthropic"
 	zcodeAPI          = "https://zcode.z.ai"
 	zcodeZaiAPI       = "https://api.z.ai"
+	zcodeBigModelAPI  = "https://bigmodel.cn" // BigModel's business API, where ZCode asks it
 )
 
 // zcodeAppVersion is the ZCode whose sign-in magpie makes.
 const zcodeAppVersion = "3.14.3"
 
-var zcodeModels = []catalog.Model{
-	{ID: "GLM-5.3", Name: "GLM-5.3", Context: 1_000_000, Efforts: []string{"low", "high", "max"}},
-	{ID: "GLM-5.3-Flash", Name: "GLM-5.3-Flash", Context: 1_000_000, Efforts: []string{"low", "high", "max"}},
-	{ID: "GLM-5.2", Name: "GLM-5.2", Context: 1_000_000, Efforts: []string{"none", "high", "max"}},
-	{ID: "GLM-5-Turbo", Name: "GLM-5-Turbo", Context: 200_000, Efforts: []string{"none", "high"}},
-}
-
 // zcodeKey is a coding plan's key and where it is served.
 type zcodeKey struct {
-	Key  string `json:"apiKey"`
+	Key  string `json:"apiKey,omitempty"`
 	Base string `json:"base"`
+	JWT  string `json:"jwt,omitempty"` // ZCode's session token, the Start Plan's key (zcode_start.go)
+	// A seat on a team's plan (zcode_team.go): the team project it is in,
+	// and the account's business sign-in, as its Authorization, for the
+	// plan's term and resets. Key is the project's own key, or "" while it
+	// is still to be found (ZCode's own account).
+	Token   string `json:"token,omitempty"`
+	Org     string `json:"org,omitempty"`
+	Project string `json:"project,omitempty"`
+	// UID is the account's user id, as ZCode's sign-in names it: with the
+	// site, which account this is (zcodeSame).
+	UID string `json:"uid,omitempty"`
 }
 
 // ---- ZCode's own account ------------------------------------------------------
 
 func zcodeCredentialsPath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".zcode", "v2", "credentials.json")
+	// under the folder ZCode's data was moved to, when it was
+	return filepath.Join(appdir.ZCodeDataIn(appdir.ZCodeHome(home)), ".zcode", "v2", "credentials.json")
 }
 
 // zcodeSecret is the key ZCode encrypts its credentials with.
@@ -124,8 +130,9 @@ func zcodeDecrypt(secret []byte, v string) (string, bool) {
 	return string(out), err == nil
 }
 
-// zcodeOwn is the account ZCode is signed in to and its coding plan's key;
-// ok is false when it has none.
+// zcodeOwn is the account ZCode is signed in to, its coding plan's key and
+// ZCode's session token (the Start Plan's key); ok is false when it has
+// neither.
 func zcodeOwn() (who string, k zcodeKey, ok bool) {
 	var store map[string]string
 	if !readJSON(zcodeCredentialsPath(), &store) {
@@ -150,20 +157,76 @@ func zcodeOwn() (who string, k zcodeKey, ok bool) {
 			k = zcodeKey{Key: key, Base: base}
 		}
 	}
+	// ZCode 3.15 keeps no plan key in its credentials; the one it uses
+	// sits in config.json, the provider's options.apiKey (#2130)
 	if k.Key == "" {
+		k = zcodeConfigKey(secret)
+	}
+	if v, ok := store["zcodejwttoken"]; ok {
+		if s, ok := zcodeDecrypt(secret, v); ok {
+			k.JWT = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "Bearer "))
+		}
+	}
+	// ZCode switched to a team's plan: that project's key, found when asked
+	if t, ok := zcodeOwnTeam(store, secret); ok {
+		t.JWT = k.JWT
+		k = t
+	}
+	if k.Key == "" && k.JWT == "" && !k.team() {
 		return "", zcodeKey{}, false
+	}
+	if k.Base == "" {
+		k.Base = ZCodeZaiBase
 	}
 	var info struct {
 		Email string `json:"email"`
 		Name  string `json:"name"`
 		ID    string `json:"user_id"`
 	}
-	if v, ok := store["oauth:zai:user_info"]; ok {
-		if s, ok := zcodeDecrypt(secret, v); ok {
-			_ = json.Unmarshal([]byte(s), &info)
+	for _, name := range []string{"oauth:zai:user_info", "oauth:bigmodel:user_info"} {
+		if v, ok := store[name]; ok && info.Email+info.Name+info.ID == "" {
+			if s, ok := zcodeDecrypt(secret, v); ok {
+				_ = json.Unmarshal([]byte(s), &info)
+			}
 		}
 	}
+	k.UID = strings.TrimSpace(info.ID)
 	return zcodeWho(info.Email, info.Name, info.ID), k, true
+}
+
+// zcodeConfigKey is the coding plan key ZCode's config.json gives its
+// built-in coding plan provider, Z.ai's first, as ZCode lists them; ZCode
+// reads it as it is, and one written encrypted is read too.
+func zcodeConfigKey(secret []byte) zcodeKey {
+	var cfg struct {
+		Provider map[string]struct {
+			Options struct {
+				APIKey string `json:"apiKey"`
+			} `json:"options"`
+		} `json:"provider"`
+	}
+	if !readJSON(filepath.Join(filepath.Dir(zcodeCredentialsPath()), "config.json"), &cfg) {
+		return zcodeKey{}
+	}
+	for _, p := range []struct {
+		ids  []string
+		base string
+	}{
+		{[]string{"builtin:zai-coding-plan", "account:zai-individual-coding-plan"}, ZCodeZaiBase},
+		{[]string{"builtin:bigmodel-coding-plan", "account:bigmodel-individual-coding-plan"}, ZCodeBigModelBase},
+	} {
+		for _, id := range p.ids {
+			key := strings.TrimSpace(cfg.Provider[id].Options.APIKey)
+			if strings.HasPrefix(key, "enc:") {
+				key, _ = zcodeDecrypt(secret, key)
+				key = strings.TrimSpace(key)
+			}
+			if strings.Contains(key, ".") && !strings.ContainsAny(key, " {$") {
+				return zcodeKey{Key: key, Base: p.base}
+			}
+		}
+	}
+	return zcodeKey{}
 }
 
 // zcodeWho names a Z.ai account: its email, or the phone number of one
@@ -191,7 +254,7 @@ type zcodeLoginKey struct {
 
 func zcodeSaved(l savedLogin) (zcodeKey, bool) {
 	var k zcodeKey
-	if json.Unmarshal(l.Auth, &k) != nil || k.Key == "" {
+	if json.Unmarshal(l.Auth, &k) != nil || k.Key == "" && k.JWT == "" && !k.team() {
 		return zcodeKey{}, false
 	}
 	if k.Base == "" {
@@ -220,107 +283,7 @@ func zcodeLogins() []zcodeLoginKey {
 	return out
 }
 
-func zcodeSide() []sideLogin {
-	var out []sideLogin
-	for _, z := range zcodeLogins() {
-		out = append(out, sideLogin{Login: z.Login})
-	}
-	return out
-}
-
-func zcodeLoginList() []Login { return loginsOf(zcodeSide()) }
-
-func switchZCodeLogin(user string) error { return switchSideLogin("zcode", user, zcodeSide()) }
-
-func setZCodeLoginOn(user string, on bool) error {
-	return setSideLoginOn("zcode", user, on, zcodeSide())
-}
-
-func forgetZCodeLogin(user string) error {
-	return forgetSideLogin("zcode", user, "ZCode's own sign-in; sign out in ZCode", zcodeSide(), nil)
-}
-
-func zcodeAccount() (Provider, bool) {
-	ls := zcodeLogins()
-	if len(ls) == 0 {
-		return Provider{}, false
-	}
-	return zcodeProvider(ls[0].User, ls[0].Plan, ls[0].key), true
-}
-
-// zcodeAlsoOn is the ZCode accounts in use behind the first.
-func zcodeAlsoOn() []Provider {
-	var out []Provider
-	for _, l := range zcodeLogins() {
-		if !l.Active && l.On {
-			out = append(out, zcodeProvider(l.User, l.Plan, l.key))
-		}
-	}
-	return out
-}
-
-func zcodeProvider(who, plan string, k zcodeKey) Provider {
-	acct := &Account{Agent: "zcode", User: who, Plan: plan}
-	acct.sign = func(ctx context.Context, req *http.Request, body []byte) error {
-		req.Header.Del("Authorization")
-		req.Header.Set("x-api-key", k.Key)
-		req.Header.Set("Authorization", "Bearer "+k.Key)
-		return nil
-	}
-	acct.models = func() []catalog.Model { return zcodeModels }
-	acct.fetch = func(ctx context.Context) ([]catalog.Model, error) {
-		ms, err := zcodeFetchModels(ctx, k.Base)
-		if err != nil {
-			return nil, err
-		}
-		return ms, catalog.SaveLive("zcode", k.Base, ms)
-	}
-	return Provider{ID: "zcode", Name: "ZCode", Icon: "zcode", Anthropic: k.Base, Website: "https://zcode.z.ai", Account: acct}
-}
-
 // ---- allowance ----------------------------------------------------------------
-
-// zcodeQuota is a coding plan's allowance: credits per five hours and per
-// week, as ZCode shows them.
-func zcodeQuota(ctx context.Context, l Login, k zcodeKey) SubscriptionQuota {
-	q := SubscriptionQuota{Provider: "zcode", Name: "ZCode", Icon: "zcode", Plan: l.Plan, User: l.User, Windows: []QuotaWindow{}}
-	var data struct {
-		Limits []struct {
-			Type      string  `json:"type"`
-			Unit      int     `json:"unit"`
-			Number    int     `json:"number"`
-			Usage     float64 `json:"usage"`
-			Current   float64 `json:"currentValue"`
-			Remaining float64 `json:"remaining"`
-			Percent   float64 `json:"percentage"`
-			Reset     int64   `json:"nextResetTime"`
-		} `json:"limits"`
-		Level string `json:"level"`
-	}
-	if err := zcodeGet(ctx, zcodeRoot(k.Base)+"/api/monitor/usage/quota/limit", k.Key, &data); err != nil {
-		q.Error = err.Error()
-		return q
-	}
-	if data.Level != "" {
-		q.Plan = "GLM Coding " + strings.ToUpper(data.Level[:1]) + data.Level[1:]
-	}
-	for _, x := range data.Limits {
-		span := zcodeSpan(x.Unit, x.Number)
-		w := QuotaWindow{Name: zcodeWindowName(span), Used: x.Percent, Span: span}
-		if x.Usage > 0 {
-			used := x.Usage - x.Remaining
-			w.Used = 100 * used / x.Usage
-			w.Display = fmt.Sprintf("%s / %s", compactNumber(used), compactNumber(x.Usage))
-		}
-		if x.Reset > 0 {
-			t := time.UnixMilli(x.Reset)
-			w.ResetsAt = &t
-		}
-		q.Windows = append(q.Windows, w)
-	}
-	q.Until, q.Renew = zhipuTerm(ctx, zcodeRoot(k.Base), k.Key)
-	return q
-}
 
 // zhipuTerm is how long a GLM Coding plan is paid for, from the
 // account's subscriptions as ZCode reads them: the valid one's next
@@ -378,39 +341,6 @@ func zhipuTermOf(subs []zhipuSubscription) (*time.Time, string) {
 	return nil, ""
 }
 
-// zcodeSpan reads a limit's window: unit 3 counts hours, 6 weeks (and
-// 4, 5 days and months by the same count).
-func zcodeSpan(unit, n int) time.Duration {
-	n = max(n, 1)
-	switch unit {
-	case 1:
-		return time.Duration(n) * time.Minute
-	case 3:
-		return time.Duration(n) * time.Hour
-	case 4:
-		return time.Duration(n) * 24 * time.Hour
-	case 5:
-		return time.Duration(n) * 30 * 24 * time.Hour
-	case 6:
-		return time.Duration(n) * 7 * 24 * time.Hour
-	}
-	return 0
-}
-
-func zcodeWindowName(span time.Duration) string {
-	switch {
-	case span == 0:
-		return "Credits"
-	case span < 24*time.Hour:
-		return fmt.Sprintf("%d hours", int(span.Hours()))
-	case span == 7*24*time.Hour:
-		return "Weekly"
-	case span >= 28*24*time.Hour:
-		return "Monthly"
-	}
-	return fmt.Sprintf("%d days", int(span.Hours()/24))
-}
-
 // zcodeRoot is the site a plan's endpoint is on: https://api.z.ai.
 func zcodeRoot(base string) string {
 	if u, err := url.Parse(base); err == nil && u.Host != "" {
@@ -419,37 +349,17 @@ func zcodeRoot(base string) string {
 	return zcodeZaiAPI
 }
 
-func zcodeLoginQuota(ctx context.Context, l Login) SubscriptionQuota {
-	for _, z := range zcodeLogins() {
-		if strings.EqualFold(z.User, l.User) {
-			return zcodeQuota(ctx, l, z.key)
-		}
-	}
-	return SubscriptionQuota{Provider: "zcode", Plan: l.Plan, Windows: []QuotaWindow{}, Error: "not signed in"}
-}
-
-// zcodePlan names the coding plan a key has, "" for none.
-func zcodePlan(ctx context.Context, k zcodeKey) (string, error) {
-	var subs []struct {
-		Product string `json:"productName"`
-		Status  string `json:"status"`
-	}
-	if err := zcodeGet(ctx, zcodeRoot(k.Base)+"/api/biz/subscription/list", k.Key, &subs); err != nil {
-		return "", err
-	}
-	for _, s := range subs {
-		if strings.EqualFold(s.Status, "VALID") {
-			return s.Product, nil
-		}
-	}
-	return "", nil
-}
-
 // ---- Z.ai's API ---------------------------------------------------------------
 
 // zcodeCall asks one of Z.ai's JSON endpoints, which wrap what they say in
 // {code, msg, data}: code 0 or 200 is a success.
 func zcodeCall(ctx context.Context, method, u, auth string, body, dst any) error {
+	return zcodeCallH(ctx, method, u, auth, nil, body, dst)
+}
+
+// zcodeCallH is zcodeCall with more headers: a team's organization and
+// project.
+func zcodeCallH(ctx context.Context, method, u, auth string, hdr map[string]string, body, dst any) error {
 	var rd io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
@@ -465,7 +375,11 @@ func zcodeCall(ctx context.Context, method, u, auth string, body, dst any) error
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "ZCode/"+zcodeAppVersion)
-	res, err := http.DefaultClient.Do(req)
+	zcodeDeviceHeader(req)
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	res, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return err
 	}
@@ -478,6 +392,9 @@ func zcodeCall(ctx context.Context, method, u, auth string, body, dst any) error
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		if json.Unmarshal(b, &env) == nil && env.Msg != "" {
+			if c := strings.Trim(string(env.Code), `"`); c != "" && c != "null" && c != "0" {
+				return fmt.Errorf("%s (%d, code %s)", env.Msg, res.StatusCode, c)
+			}
 			return fmt.Errorf("%s (%d)", env.Msg, res.StatusCode)
 		}
 		return &accountStatusError{status: res.StatusCode}
@@ -500,212 +417,3 @@ func zcodeGet(ctx context.Context, u, key string, dst any) error {
 }
 
 // ---- signing in ---------------------------------------------------------------
-
-// startZCodeSignIn is ZCode's own polling sign-in: zcode.z.ai opens a flow,
-// the browser signs in to Z.ai, and the flow is asked until it is ready.
-// The account's coding plan key is then found or made, as ZCode does it.
-func startZCodeSignIn(s *signInFlow) error {
-	ctx, cancel := context.WithCancel(context.Background())
-	b := make([]byte, 32)
-	_, _ = rand.Read(b)
-	poll := "Bearer " + hex.EncodeToString(b)
-	var flow struct {
-		ID       string  `json:"flow_id"`
-		URL      string  `json:"authorize_url"`
-		Expires  float64 `json:"expires_at"`
-		Interval float64 `json:"poll_interval_sec"`
-	}
-	if err := zcodeCall(ctx, http.MethodPost, zcodeAPI+"/api/v1/oauth/cli/init", poll, map[string]string{"provider": "zai"}, &flow); err != nil {
-		cancel()
-		return fmt.Errorf("ZCode sign-in: %w", err)
-	}
-	u, err := url.Parse(flow.URL)
-	if flow.ID == "" || err != nil || u.Scheme != "https" {
-		cancel()
-		return errors.New("ZCode gave no sign-in page")
-	}
-	// where Z.ai sends the browser back, as ZCode sets it
-	back := zcodeAPI + "/app/oauth/login?" + url.Values{"redirect": {"zcode://oauth/callback"}, "app_version": {zcodeAppVersion}}.Encode()
-	q := u.Query()
-	q.Set("redirect_uri", back)
-	u.RawQuery = q.Encode()
-	s.mu.Lock()
-	s.st.URL = u.String()
-	s.stop = cancel
-	s.mu.Unlock()
-	interval := time.Duration(max(flow.Interval, 1)) * time.Second
-	deadline := time.Unix(int64(flow.Expires), 0)
-	if flow.Expires == 0 {
-		deadline = time.Now().Add(5 * time.Minute)
-	}
-	go func() {
-		defer cancel()
-		fail := func(msg string) { s.finish(SignInState{State: "failed", Error: msg}) }
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(interval):
-			}
-			if time.Now().After(deadline) {
-				fail("the sign-in expired; start again")
-				return
-			}
-			var got struct {
-				Status string `json:"status"`
-				Zai    struct {
-					AccessToken string `json:"access_token"`
-				} `json:"zai"`
-				User struct {
-					ID    string `json:"user_id"`
-					Email string `json:"email"`
-					Name  string `json:"name"`
-				} `json:"user"`
-			}
-			err := zcodeCall(ctx, http.MethodGet, zcodeAPI+"/api/v1/oauth/cli/poll/"+url.PathEscape(flow.ID), poll, nil, &got)
-			switch {
-			case ctx.Err() != nil:
-				return
-			case err != nil:
-				var st *accountStatusError
-				if errors.As(err, &st) && st.status >= 400 && st.status < 500 && st.status != 408 && st.status != 429 {
-					fail("ZCode sign-in: " + err.Error())
-					return
-				}
-				continue // a hiccup: ask again
-			case got.Status == "pending" || got.Status == "":
-				continue
-			case got.Status == "failed":
-				fail("the sign-in was declined on Z.ai")
-				return
-			case got.Status != "ready" || got.Zai.AccessToken == "":
-				fail("ZCode sign-in: unexpected answer " + got.Status)
-				return
-			}
-			who := zcodeWho(got.User.Email, got.User.Name, got.User.ID)
-			k, plan, err := zcodeMintKey(ctx, got.Zai.AccessToken)
-			if err != nil {
-				fail(err.Error())
-				return
-			}
-			auth, _ := json.Marshal(k)
-			ownUser, _, ok := zcodeOwn()
-			if !ok {
-				ownUser = ""
-			}
-			if err := addSideLogin(savedLogin{Agent: "zcode", User: who, Plan: plan, Auth: auth}, ownUser, func(savedLogin) {}); err != nil {
-				fail(err.Error())
-				return
-			}
-			s.finish(SignInState{State: "done", User: who, Plan: plan, Using: ok && strings.EqualFold(ownUser, who)})
-			return
-		}
-	}()
-	return nil
-}
-
-// zcodeMintKey turns a Z.ai sign-in into its coding plan key: Z.ai's
-// business token, then the key named zcode-api-key in the account's default
-// project, made if it isn't there, with its secret.
-func zcodeMintKey(ctx context.Context, zaiToken string) (zcodeKey, string, error) {
-	var biz struct {
-		Token string `json:"access_token"`
-	}
-	if err := zcodeCall(ctx, http.MethodPost, zcodeZaiAPI+"/api/auth/z/login", "", map[string]string{"token": zaiToken}, &biz); err != nil || biz.Token == "" {
-		return zcodeKey{}, "", fmt.Errorf("Z.ai sign-in: %v", firstErr(err, "no token"))
-	}
-	bearer := "Bearer " + biz.Token
-	var info struct {
-		Orgs []struct {
-			ID       string `json:"organizationId"`
-			Name     string `json:"organizationName"`
-			Projects []struct {
-				ID   string `json:"projectId"`
-				Name string `json:"projectName"`
-				Type any    `json:"projectType"`
-			} `json:"projects"`
-		} `json:"organizations"`
-	}
-	if err := zcodeCall(ctx, http.MethodGet, zcodeZaiAPI+"/api/biz/customer/getCustomerInfo", bearer, nil, &info); err != nil {
-		return zcodeKey{}, "", fmt.Errorf("Z.ai account: %w", err)
-	}
-	// the default organization and project, as ZCode picks them
-	org, proj := "", ""
-	for _, o := range info.Orgs {
-		var ps []string
-		def := ""
-		for _, p := range o.Projects {
-			if p.ID == "" || fmt.Sprint(p.Type) == "2" {
-				continue
-			}
-			ps = append(ps, p.ID)
-			if def == "" && strings.Contains(p.Name, "默认项目") {
-				def = p.ID
-			}
-		}
-		if o.ID == "" || len(ps) == 0 {
-			continue
-		}
-		if def == "" {
-			def = ps[0]
-		}
-		if org == "" || strings.Contains(o.Name, "默认机构") {
-			org, proj = o.ID, def
-			if strings.Contains(o.Name, "默认机构") {
-				break
-			}
-		}
-	}
-	if org == "" {
-		return zcodeKey{}, "", errors.New("this Z.ai account has no project for an API key")
-	}
-	keys := zcodeZaiAPI + "/api/biz/v1/organization/" + url.PathEscape(org) + "/projects/" + url.PathEscape(proj) + "/api_keys"
-	type apiKey struct {
-		Name   string `json:"name"`
-		APIKey string `json:"apiKey"`
-	}
-	var list []apiKey
-	if err := zcodeCall(ctx, http.MethodGet, keys, bearer, nil, &list); err != nil {
-		return zcodeKey{}, "", fmt.Errorf("Z.ai API keys: %w", err)
-	}
-	id := ""
-	for _, k := range list {
-		if k.Name == "zcode-api-key" {
-			id = strings.TrimSpace(k.APIKey)
-		}
-	}
-	if id == "" {
-		var made apiKey
-		if err := zcodeCall(ctx, http.MethodPost, keys, bearer, map[string]string{"name": "zcode-api-key"}, &made); err != nil {
-			return zcodeKey{}, "", fmt.Errorf("Z.ai API key: %w", err)
-		}
-		id = strings.TrimSpace(made.APIKey)
-	}
-	var secret struct {
-		Secret string `json:"secretKey"`
-	}
-	if id != "" {
-		if err := zcodeCall(ctx, http.MethodGet, keys+"/copy/"+url.PathEscape(id), bearer, nil, &secret); err != nil {
-			return zcodeKey{}, "", fmt.Errorf("Z.ai API key: %w", err)
-		}
-	}
-	if id == "" || strings.TrimSpace(secret.Secret) == "" {
-		return zcodeKey{}, "", errors.New("Z.ai gave no API key")
-	}
-	k := zcodeKey{Key: id + "." + strings.TrimSpace(secret.Secret), Base: ZCodeZaiBase}
-	plan, err := zcodePlan(ctx, k)
-	if err != nil {
-		return zcodeKey{}, "", fmt.Errorf("GLM Coding Plan: %w", err)
-	}
-	if plan == "" {
-		return zcodeKey{}, "", errors.New("this Z.ai account has no GLM Coding Plan — subscribe at z.ai/subscribe, then add it again")
-	}
-	return k, plan, nil
-}
-
-func firstErr(err error, otherwise string) string {
-	if err != nil {
-		return err.Error()
-	}
-	return otherwise
-}

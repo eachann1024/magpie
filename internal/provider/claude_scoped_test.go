@@ -2,39 +2,18 @@ package provider
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// The usage endpoint's limits[] carries a week's allowance per model (#139).
+// Claude Code's /usage tells a week's allowance per model (#139).
 func TestClaudeWindowsModelScoped(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{
-  "five_hour": { "utilization": 2, "resets_at": "2026-07-20T10:00:00+00:00" },
-  "seven_day": { "utilization": 88, "resets_at": "2026-07-24T20:00:00+00:00" },
-  "seven_day_opus": { "utilization": 12, "resets_at": "2026-07-24T20:00:00+00:00" },
-  "limits": [
-    { "kind": "weekly_scoped", "percent": 55, "scope": null },
-    {
-      "kind": "weekly_scoped",
-      "percent": 64,
-      "resets_at": "2026-07-24T20:00:00+00:00",
-      "is_active": false,
-      "scope": { "model": { "display_name": "Fable" } }
-    },
-    { "kind": "weekly_scoped", "percent": 12, "resets_at": "2026-07-24T20:00:00+00:00", "scope": { "model": { "display_name": "Opus" } } },
-    { "kind": "session", "percent": 2, "scope": { "model": { "display_name": "Haiku" } } }
-  ]
-}`))
-	}))
-	defer srv.Close()
-	old := claudeBase
-	claudeBase = srv.URL
-	defer func() { claudeBase = old }()
-
-	ws, err := readClaudeWindows(context.Background(), "t")
+	now := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	ws, err := parseClaudeUsage(`Current session: 2% used · resets Jul 20 at 3am (UTC)
+Current week (all models): 88% used · resets Jul 24 at 8pm (UTC)
+Current week (Opus): 12% used · resets Jul 24 at 8pm (UTC)
+Current week (Fable): 64% used · resets Jul 24 at 8pm (UTC)`, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +31,6 @@ func TestClaudeWindowsModelScoped(t *testing.T) {
 	}
 
 	// Fable used up stops Fable, not the other models
-	now := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
 	ws[3].Used = 100
 	a := allowanceOf(ws, now)
 	if used, _ := a.For("claude-fable-5-1", now); used != 100 {
@@ -77,9 +55,9 @@ func TestClaudeScopeModel(t *testing.T) {
 // Claude Code's seven_day_overage_included is the Fable week, in place of
 // the one the usage endpoint told.
 func TestNoteClaudeLimitsFable(t *testing.T) {
-	old := claudeBase
-	claudeBase = "http://127.0.0.1:1" // nothing answers there
-	defer func() { claudeBase = old }()
+	var out atomic.Value
+	out.Store("")
+	fakeClaudeUsage(t, &out, nil)
 	claudeUsage.Lock()
 	claudeUsage.m = map[string]claudeUsageEntry{"kev@example.com": {at: time.Now().Add(-time.Hour), ws: []QuotaWindow{
 		{Name: "5 hours", Used: 5}, {Name: "7 days · Fable", Used: 30, Model: "fable"},
@@ -88,11 +66,57 @@ func TestNoteClaudeLimitsFable(t *testing.T) {
 	defer func() { claudeUsage.Lock(); claudeUsage.m = nil; claudeUsage.Unlock() }()
 
 	NoteClaudeLimits("kev@example.com", []ClaudeLimit{{Kind: "seven_day_overage_included", Used: 1}})
-	ws, err := claudeWindows(context.Background(), "kev@example.com", "tok")
+	ws, err := claudeWindows(context.Background(), "kev@example.com", true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(ws) != 2 || ws[1].Name != "7 days · Fable" || ws[1].Used != 100 || ws[1].Model != "fable" || ws[1].Span != 7*24*time.Hour {
 		t.Fatalf("windows: %+v", ws)
+	}
+}
+
+// StringKe (#4532): Claude Code 2.1.316 names the Sonnet week "Current
+// week (Sonnet only)", and it was read as a window of models named
+// "sonnet-only", which no model is: the Sonnet week used up stopped
+// nothing, and it was a row apart from the seven_day_sonnet header's.
+// It is the Sonnet week, as the header's.
+func TestClaudeUsageSonnetOnly(t *testing.T) {
+	now := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	ws, err := parseClaudeUsage(`Current session: 2% used · resets 3am (UTC)
+Current week (all models): 30% used · resets Nov 5 at 8pm (UTC)
+Current week (Sonnet only): 100% used · resets Nov 5 at 8pm (UTC)`, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 3 || ws[2].Name != "7 days · Sonnet" || ws[2].Model != "sonnet" || ws[2].Used != 100 {
+		t.Fatalf("windows: %+v", ws)
+	}
+	a := allowanceOf(ws, now)
+	if used, _ := a.For("claude-sonnet-5", now); used != 100 {
+		t.Fatalf("sonnet: %v", used)
+	}
+	if used, _ := a.For("claude-opus-5-5", now); used != 30 {
+		t.Fatalf("opus: %v", used)
+	}
+	// the header's Sonnet week takes its place, not a row beside it
+	var out atomic.Value
+	out.Store("")
+	fakeClaudeUsage(t, &out, nil)
+	claudeUsage.Lock()
+	claudeUsage.m = map[string]claudeUsageEntry{"s@example.com": {at: time.Now().Add(-time.Hour), ws: ws}}
+	claudeUsage.Unlock()
+	defer func() { claudeUsage.Lock(); claudeUsage.m = nil; claudeUsage.Unlock() }()
+	NoteClaudeLimits("s@example.com", []ClaudeLimit{{Kind: "seven_day_sonnet", Used: .5}})
+	claudeUsage.Lock()
+	got := claudeUsage.m["s@example.com"].ws
+	claudeUsage.Unlock()
+	n := 0
+	for _, w := range got {
+		if w.Model == "sonnet" || w.Model == "sonnet-only" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("Sonnet weeks: %+v", got)
 	}
 }

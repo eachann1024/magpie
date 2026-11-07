@@ -33,6 +33,9 @@ func version(t *testing.T, path string) string {
 // A folder magpie may not write to: Install fails with a permission error,
 // leaves the app as it was, and keeps what it staged.
 func TestInstallNeedsAdmin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a read-only folder and the administrator's password are a Mac's and Linux's")
+	}
 	if os.Getuid() == 0 {
 		t.Skip("root writes anywhere")
 	}
@@ -40,7 +43,7 @@ func TestInstallNeedsAdmin(t *testing.T) {
 	apps := filepath.Join(root, "Applications")
 	bundle := filepath.Join(apps, "magpie.app")
 	app(t, bundle, "old")
-	staged := filepath.Join(root, "cache", "app", "magpie.app")
+	staged := filepath.Join(root, "cache", "update", stagedName)
 	app(t, staged, "new")
 	os.Chmod(apps, 0o555)
 	defer os.Chmod(apps, 0o755)
@@ -60,8 +63,11 @@ func TestInstallNeedsAdmin(t *testing.T) {
 // The script InstallAsAdmin runs as root swaps the apps, awkward names and
 // all; run here as the user in a folder they own.
 func TestSwapScript(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the swap runs as root under /bin/sh, on a Mac or Linux")
+	}
 	dir := filepath.Join(t.TempDir(), `it's "a" \ $(dir) `)
-	bundle, staged, old := filepath.Join(dir, "magpie.app"), filepath.Join(dir, "s", "magpie.app"), filepath.Join(dir, "s", "old.app")
+	bundle, staged, old := filepath.Join(dir, "magpie.app"), filepath.Join(dir, "s", stagedName), filepath.Join(dir, "s", asideName)
 	app(t, bundle, "old")
 	app(t, staged, "new")
 	if b, err := exec.Command("/bin/sh", "-c", swapScript(staged, bundle, old)).CombinedOutput(); err != nil {

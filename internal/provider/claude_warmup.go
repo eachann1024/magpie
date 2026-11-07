@@ -33,24 +33,21 @@ func claudeWarmUsage(ctx context.Context) map[string]SubscriptionQuota {
 }
 
 // warmClaudeLogin is a warm-up's send for the Claude accounts: send asks
-// Claude Code, with oauth the sign-in of a saved account, "" for the one
-// Claude Code is signed in to.
-func warmClaudeLogin(send func(ctx context.Context, oauth string) error) func(context.Context, string) error {
+// Claude Code, with configDir the config directory of a saved account
+// (claude_dirs.go), "" for the one Claude Code is signed in to.
+func warmClaudeLogin(send func(ctx context.Context, configDir string) error) func(context.Context, string) error {
 	return func(ctx context.Context, user string) error {
+		// the account's own proxy, which send's Claude Code runs with too
+		ctx = ViaLogin(ctx, "claude", user)
 		ls := Logins("claude")
 		i := slices.IndexFunc(ls, func(l Login) bool { return strings.EqualFold(l.User, user) })
 		if i < 0 {
 			return fmt.Errorf("no Claude account %q", user)
 		}
-		oauth := ""
 		if !ls[i].Active {
-			tok, _, err := savedLoginToken(ctx, "claude", ls[i].User)
-			if err != nil {
-				return err
-			}
-			oauth = tok
+			return inSavedClaudeDir(ls[i].User, func(dir string) error { return send(ctx, dir) })
 		}
-		return send(ctx, oauth)
+		return send(ctx, "")
 	}
 }
 
@@ -60,13 +57,17 @@ var claudeWindowsExpected = []QuotaWindow{{Name: "5 hours", Span: 5 * time.Hour}
 
 // claudeWarmedNow has what the Claude account user has left read again,
 // not taken from the last few minutes' read: the window a warm-up started
-// has its reset known, and routing ranks the account by it at once.
+// has its reset known, and routing ranks the account by it at once. The
+// next read is due as for an account never read (claudeWindows), and what
+// is kept keeps its own time until then: cleared, the card stamped the
+// windows read before the warm-up as read just now, and no read was due
+// (koohoko5924).
 func claudeWarmedNow(user string) {
 	key := strings.ToLower(user)
 	c := &claudeUsage
 	c.Lock()
 	if e, ok := c.m[key]; ok {
-		e.at = time.Time{}
+		e.tried = time.Time{}
 		c.m[key] = e
 	}
 	c.Unlock()
@@ -79,8 +80,8 @@ func ClaudeWarmed() map[string]time.Time { return codexWarmedIn(claudeWarmPath()
 
 // KeepClaudeWindowsWarm starts the Claude accounts' windows as they reset,
 // while settings say to, each with one request send makes.
-func KeepClaudeWindowsWarm(ctx context.Context, send func(ctx context.Context, oauth string) error) {
+func KeepClaudeWindowsWarm(ctx context.Context, send func(ctx context.Context, configDir string) error) {
 	w := codexWarmer{path: claudeWarmPath(), now: time.Now, usage: claudeWarmUsage, send: warmClaudeLogin(send),
 		expect: claudeWindowsExpected, warmed: claudeWarmedNow}
-	keepWarm(ctx, "claude", w, func() (string, string) { s := settings.Load(); return s.ClaudeWarmup, s.ClaudeWarmAt })
+	keepWarm(ctx, "claude", w, func() (string, []string) { s := settings.Load(); return s.ClaudeWarmup, s.ClaudeWarmAts })
 }

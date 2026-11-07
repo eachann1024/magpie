@@ -1,6 +1,7 @@
 package sessions
 
 import (
+	"cmp"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -8,8 +9,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -44,7 +47,7 @@ import (
 // OpenCodeDir is OpenCode's data folder: $XDG_DATA_HOME/opencode, else
 // ~/.local/share/opencode — on Windows too, where OpenCode keeps it there.
 func OpenCodeDir() string {
-	if d := os.Getenv("XDG_DATA_HOME"); d != "" {
+	if d := appdir.Getenv("XDG_DATA_HOME"); d != "" {
 		return filepath.Join(d, "opencode")
 	}
 	home, _ := os.UserHomeDir()
@@ -54,7 +57,7 @@ func OpenCodeDir() string {
 // openCodeDB is OpenCode's database: $OPENCODE_DB (a path in the data
 // folder unless absolute), else opencode.db there.
 func openCodeDB() string {
-	if p := os.Getenv("OPENCODE_DB"); p != "" && p != ":memory:" {
+	if p := appdir.Getenv("OPENCODE_DB"); p != "" && p != ":memory:" {
 		if filepath.IsAbs(p) {
 			return p
 		}
@@ -82,7 +85,16 @@ type ocMessage struct {
 	// ZCode's newer messages say modelId, which the key matches too (the
 	// decoder takes a key in any case when none is spelt as it is)
 	ModelID string `json:"modelID"`
-	Time    struct {
+	// the provider the reply came from: magpie's gateway is "magpie"
+	ProviderID string `json:"providerID,omitempty"`
+	// a reply's variant: the reasoning effort picked in OpenCode's model
+	// menu for its prompt (high, max, low …; "default" or none when none
+	// was). OpenCode 2 keeps it in model.variant (#680)
+	Variant string `json:"variant,omitempty"`
+	// what ended the reply, when something did: {name, data {message}}, or
+	// in OpenCode 2 {type, message}
+	Error json.RawMessage `json:"error,omitempty"`
+	Time  struct {
 		Created   int64 `json:"created"`
 		Completed int64 `json:"completed"`
 	} `json:"time"`
@@ -102,6 +114,79 @@ type ocMessage struct {
 	Semantics *struct {
 		Origin string `json:"origin"`
 	} `json:"semantics"`
+	// OpenCode 2: the tools a reply called and the skills a message
+	// brought in, as ocV2DB.messages reads them
+	Calls []ocUse `json:"calls,omitempty"`
+	// ZCode: where a message copied into another session came from
+	// (zcDB.copied)
+	Metadata *struct {
+		ForkOrigin *struct {
+			SessionID string `json:"sessionId"`
+			MessageID string `json:"messageId"`
+		} `json:"forkOrigin"`
+	} `json:"metadata,omitempty"`
+}
+
+// ocUse is a tool called, or a skill brought in with no tool (Name "").
+type ocUse struct {
+	Name  string `json:"name,omitempty"`
+	Skill string `json:"skill,omitempty"`
+	At    int64  `json:"at,omitempty"`
+}
+
+// ocV2Calls is what an OpenCode 2 message's data says was called. A
+// reply's content has a {"type":"tool","name",…,"state":{"input"}} for
+// each tool, the skill tool's input {"id": <skill>}; a prompt whose skill
+// was picked (@<skill> in the TUI) lists it in skills [{"id","name",…}];
+// and a skill row, a skill brought in by itself
+// (POST /api/experimental/session/{id}/skill), names it in skill.
+func ocV2Calls(typ string, b []byte) []ocUse {
+	var d struct {
+		Content []struct {
+			Type  string `json:"type"`
+			Name  string `json:"name"`
+			State struct {
+				Input struct {
+					ID string `json:"id"`
+				} `json:"input"`
+			} `json:"state"`
+			Time struct {
+				Created int64 `json:"created"`
+			} `json:"time"`
+		} `json:"content"`
+		Skills []struct {
+			ID string `json:"id"`
+		} `json:"skills"`
+		Skill string `json:"skill"`
+	}
+	if json.Unmarshal(b, &d) != nil {
+		return nil
+	}
+	var out []ocUse
+	switch typ {
+	case "assistant":
+		for _, c := range d.Content {
+			if c.Type != "tool" || c.Name == "" {
+				continue
+			}
+			k := ""
+			if c.Name == "skill" {
+				k = c.State.Input.ID
+			}
+			out = append(out, ocUse{Name: c.Name, Skill: k, At: c.Time.Created})
+		}
+	case "user":
+		for _, k := range d.Skills {
+			if k.ID != "" {
+				out = append(out, ocUse{Skill: k.ID})
+			}
+		}
+	case "skill":
+		if d.Skill != "" {
+			out = append(out, ocUse{Skill: d.Skill})
+		}
+	}
+	return out
 }
 
 // ocPart is a part of a message: only its text is looked at, for a title.
@@ -131,6 +216,9 @@ func ms(n int64) time.Time {
 // messages and its time that of the latest change to one; from the files
 // its own file's path, the sum of its messages' sizes and the latest time.
 func openCodeFiles() []file {
+	if !Reads("opencode") {
+		return nil
+	}
 	if db := openCodeDB(); fileExists(db) {
 		return openCodeDBFiles("opencode", db)
 	}
@@ -146,12 +234,13 @@ func fileExists(p string) bool {
 // at the top: a subagent's subagent counts there too.
 func ocRoots(out []file, parent map[string]string) []file {
 	for i := range out {
-		root := out[i].sid
+		root := out[i].m().sid
 		for n := 0; parent[root] != "" && n < 64; n++ {
 			root = parent[root]
 		}
 		out[i].key = out[i].agent + ":" + root
-		out[i].main = parent[out[i].sid] == ""
+		out[i].w().parent = parent[out[i].m().sid]
+		out[i].main = out[i].m().parent == ""
 	}
 	return out
 }
@@ -159,8 +248,27 @@ func ocRoots(out []file, parent map[string]string) []file {
 // ---- the database -------------------------------------------------------------
 
 // dbs are the databases open while List or Stats reads them, closed when
-// they are done (closeDBs).
+// the last of the reads using them is done (useDBs).
 var dbs = map[string]*sql.DB{}
+
+// dbUsers is how many reads use dbs now. A read lets mu go while it parses
+// with them, and another read may then start and end: it must not close
+// what the first is still reading (#2776).
+var dbUsers int
+
+// useDBs counts a read, with mu held, as a user of dbs until the release it
+// returns is called, with mu held again; the last to go closes them.
+func useDBs() (release func()) {
+	dbUsers++
+	return sync.OnceFunc(func() {
+		if dbUsers--; dbUsers == 0 {
+			closeDBs()
+		}
+	})
+}
+
+// Snapshot readers also remove their temporary database when a scan ends.
+var dbCleanup = map[string]func(){}
 
 func openDB(path string) *sql.DB {
 	if db := dbs[path]; db != nil {
@@ -177,7 +285,12 @@ func openDB(path string) *sql.DB {
 
 func closeDBs() {
 	for p, db := range dbs {
-		db.Close()
+		if done := dbCleanup[p]; done != nil {
+			done()
+			delete(dbCleanup, p)
+		} else {
+			db.Close()
+		}
 		delete(dbs, p)
 	}
 }
@@ -186,15 +299,24 @@ type ocDB struct{ db *sql.DB }
 
 // openCodeDBFiles are the sessions in OpenCode's database, or ZCode's.
 func openCodeDBFiles(agent, path string) []file {
+	if !Reads(agent) {
+		return nil
+	}
 	db := openDB(path)
 	if db == nil {
 		return nil
 	}
+	return openCodeDBFilesIn(agent, path, db, "COUNT(m.id)")
+}
+
+// openCodeDBFilesIn is openCodeDBFiles on a database already open, a
+// session's size what the SQL size makes of its messages m.
+func openCodeDBFilesIn(agent, path string, db *sql.DB, size string) []file {
 	var store ocStore = ocDB{db}
 	if agent == "zcode" {
 		store = zcDB{ocDB{db}}
 	}
-	const q = `SELECT s.id, COALESCE(s.parent_id, ''), s.time_updated, COUNT(m.id), COALESCE(MAX(m.time_updated), 0)
+	q := `SELECT s.id, COALESCE(s.parent_id, ''), s.time_updated, ` + size + `, COALESCE(MAX(m.time_updated), 0)
 		FROM %s s LEFT JOIN %s m ON m.session_id = s.id %s GROUP BY s.id`
 	parent := map[string]string{}
 	old := fmt.Sprintf(q, "session", "message", "")
@@ -228,7 +350,7 @@ func ocDBRows(db *sql.DB, query, agent, path string, store ocStore, parent map[s
 			continue
 		}
 		parent[id] = par
-		out = append(out, file{agent: agent, path: path + "#" + id, sid: id, oc: store, size: n, mod: ms(max(updated, last))})
+		out = append(out, file{agent: agent, path: path + "#" + id, size: n, mod: ms(max(updated, last)), more: &fileMore{sid: id, oc: store}})
 	}
 	return out
 }
@@ -294,18 +416,18 @@ func (s ocV2DB) info(sid string) (ocInfo, bool) {
 	return i, err == nil
 }
 
-// messages are a session's prompts, replies and compactions: a reply's
-// model is its model's id, a compaction's (which may name none) the one
-// last replied with.
+// messages are a session's prompts, replies, compactions and skills
+// brought in by themselves: a reply's model is its model's id, a
+// compaction's (which may name none) the one last replied with.
 func (s ocV2DB) messages(sid string) [][]byte {
 	rows, err := s.db.Query(`SELECT id, type, data FROM session_message
-		WHERE session_id = ? AND type IN ('user', 'assistant', 'compaction') ORDER BY seq`, sid)
+		WHERE session_id = ? AND type IN ('user', 'assistant', 'compaction', 'skill') ORDER BY seq`, sid)
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
 	var out [][]byte
-	last := ""
+	last, lastProvider, lastVariant := "", "", ""
 	for rows.Next() {
 		var id, typ string
 		var b []byte
@@ -315,21 +437,24 @@ func (s ocV2DB) messages(sid string) [][]byte {
 		var m ocMessage
 		var v struct {
 			Model *struct {
-				ID string `json:"id"`
+				ID         string `json:"id"`
+				ProviderID string `json:"providerID"`
+				Variant    string `json:"variant"`
 			} `json:"model"`
 		}
 		if json.Unmarshal(b, &m) != nil || json.Unmarshal(b, &v) != nil {
 			continue
 		}
-		m.ID, m.Role, m.ModelID = id, "assistant", last
+		m.ID, m.Role, m.ModelID, m.ProviderID, m.Variant = id, "assistant", last, lastProvider, lastVariant
 		if v.Model != nil && v.Model.ID != "" {
-			m.ModelID = v.Model.ID
+			m.ModelID, m.ProviderID, m.Variant = v.Model.ID, v.Model.ProviderID, v.Model.Variant
 		}
+		m.Calls = ocV2Calls(typ, b)
 		switch typ {
-		case "user":
-			m.Role, m.ModelID, m.Tokens = "user", "", nil
+		case "user", "skill":
+			m.Role, m.ModelID, m.ProviderID, m.Variant, m.Tokens = typ, "", "", "", nil
 		case "assistant":
-			last = m.ModelID
+			last, lastProvider, lastVariant = m.ModelID, m.ProviderID, m.Variant
 		}
 		if o, err := json.Marshal(m); err == nil {
 			out = append(out, o)
@@ -359,6 +484,9 @@ func (s ocV2DB) parts(mid string) [][]byte {
 type ocFiles struct{ root string } // storage/
 
 func openCodeJSONFiles(root string) []file {
+	if !Reads("opencode") {
+		return nil
+	}
 	infos, _ := filepath.Glob(filepath.Join(root, "session", "*", "*.json"))
 	store := ocFiles{root}
 	var out []file
@@ -369,7 +497,7 @@ func openCodeJSONFiles(root string) []file {
 		if err != nil || json.Unmarshal(b, &i) != nil || i.ID == "" {
 			continue
 		}
-		f := file{agent: "opencode", path: p, sid: i.ID, oc: store}
+		f := file{agent: "opencode", path: p, more: &fileMore{sid: i.ID, oc: store}}
 		if !stat(&f) {
 			continue
 		}
@@ -423,10 +551,10 @@ func (s ocFiles) parts(mid string) [][]byte    { return s.docs(filepath.Join("pa
 // place as its reply goes on, so there is no reading on from before.
 func parseOpenCode(f file) *state {
 	s := &state{Size: f.size, Mod: f.mod.UnixNano()}
-	if f.oc == nil {
+	if f.m().oc == nil {
 		return s
 	}
-	info, ok := f.oc.info(f.sid)
+	info, ok := f.m().oc.info(f.m().sid)
 	if !ok {
 		return s
 	}
@@ -435,7 +563,7 @@ func parseOpenCode(f file) *state {
 		s.Named = t
 	}
 	var msgs []ocMessage
-	for _, b := range f.oc.messages(f.sid) {
+	for _, b := range f.m().oc.messages(f.m().sid) {
 		var m ocMessage
 		if json.Unmarshal(b, &m) == nil {
 			msgs = append(msgs, m)
@@ -451,10 +579,13 @@ func parseOpenCode(f file) *state {
 	for _, m := range msgs {
 		at := ms(m.Time.Created)
 		s.saw(at, f.main)
+		for _, c := range m.Calls {
+			s.tool(cmp.Or(ms(c.At), at), c.Name, c.Skill)
+		}
 		switch m.Role {
 		case "user":
 			if typed := m.Semantics == nil || m.Semantics.Origin == "" || m.Semantics.Origin == "real_user"; typed && f.main && s.Title == "" && s.First == "" {
-				ocTitle(s, f.oc.parts(m.ID))
+				ocTitle(s, f.m().oc.parts(m.ID))
 			}
 		case "assistant":
 			if done := ms(m.Time.Completed); !done.IsZero() {
@@ -463,6 +594,9 @@ func parseOpenCode(f file) *state {
 			}
 			if s.Cwd == "" && m.Path != nil {
 				s.Cwd = m.Path.Cwd
+			}
+			if z, ok := f.m().oc.(zcDB); ok && z.copied(m) {
+				continue // the original's session counts it
 			}
 			if t := m.Tokens; t != nil && m.ModelID != "" {
 				u := Tokens{Input: t.Input, Output: t.Output + t.Reasoning, CacheRead: t.Cache.Read, CacheWrite: t.Cache.Write}

@@ -5,13 +5,35 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/gateway"
-	"github.com/yetone/magpie/internal/usage"
 )
+
+// sameGroup compares two values of a field, one of them read back from the
+// agent's own settings where Claude Code's [1m] mark rides on the group's
+// id: the marked one is the group magpie set, not another group — the
+// gateway serves either (#750's comparison, with the mark on one side).
+func TestSameGroupTakesTheOneMMarkOff(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"group/auto-gpt-5", "group/auto-gpt-5[1m]"},
+		{"group/auto-gpt-5[1m]", "group/auto-gpt-5"},
+		{"group/auto-gpt-5[1m]", "magpie/group/auto-gpt-5"},
+	} {
+		if !sameGroup(pair[0], pair[1]) {
+			t.Errorf("sameGroup(%q, %q) = false", pair[0], pair[1])
+		}
+	}
+	if sameGroup("group/auto-gpt-5", "group/auto-other") {
+		t.Error("two different groups are the same")
+	}
+	if sameGroup("group/auto-gpt-5", "a/gpt-5") {
+		t.Error("a group and a model are the same")
+	}
+}
 
 // Something else rewrote Codex's config: the base URL gone while the model
 // is still magpie's is unwired, and setting it again wires it back.
@@ -72,6 +94,11 @@ func TestDriftBypassed(t *testing.T) {
 	cx := codex(home)
 	defer func(s time.Time) { started = s }(started)
 	started = time.Now().Add(-time.Hour)
+	// a request reaching the gateway, kept to this run: usage.Saw's record
+	// lasts the process, so the next run (-count=2) would start with it
+	var saw time.Time
+	defer func(f func(string) time.Time) { lastSeen = f }(lastSeen)
+	lastSeen = func(string) time.Time { return saw }
 	if err := cx.Apply("model", "fake/m1"); err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +116,7 @@ func TestDriftBypassed(t *testing.T) {
 	if d := cx.Drift(); d == nil || d.Kind != "bypassed" || d.Want != "fake/m1" {
 		t.Fatalf("bypassed: %+v", d)
 	}
-	usage.Saw("codex")
+	saw = time.Now()
 	if d := cx.Drift(); d != nil {
 		t.Fatalf("a request arrived: %+v", d)
 	}
@@ -129,10 +156,20 @@ func TestDriftUnwiredEveryAgent(t *testing.T) {
 	// OpenHanako gives the model to an agent of its own
 	os.MkdirAll(filepath.Join(home, ".hanako", "agents", "hana"), 0o755)
 	os.WriteFile(filepath.Join(home, ".hanako", "agents", "hana", "config.yaml"), []byte("agent:\n  name: Hana\n"), 0o644)
+	// AstrBot is connected once it has written its settings
+	os.MkdirAll(filepath.Join(home, ".astrbot", "data"), 0o755)
+	os.WriteFile(filepath.Join(home, ".astrbot", "data", "cmd_config.json"), []byte(astrbotConfig), 0o644)
+	// QwenPaw, once it has written its agents' settings
+	qwenpawFixture(t, home)
 	for _, a := range All() {
 		// agy's gateway is in the command that starts it, in no file (its
 		// Check is TestAgy's)
-		if a.Check == nil || a.Launch != nil {
+		if a.Check == nil || a.Launch != nil || a.Native != nil {
+			continue
+		}
+		// a WSL agent's files live in the distro, beyond the sandbox home:
+		// picking a model here writes the user's real configs
+		if a.WSL != "" {
 			continue
 		}
 		t.Run(a.ID, func(t *testing.T) {
@@ -235,6 +272,7 @@ func TestCodexDriftReached(t *testing.T) {
 		at++
 		db.Exec(`INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body) VALUES (?, 0, ?, 'codex_api::endpoint::responses_websocket', ?)`,
 			at, level, "responses_websocket.connect{}: "+body)
+		forgetReached()
 	}
 	log("INFO", "connecting to websocket: "+ws)
 	log("ERROR", "failed to connect to websocket: IO error: Connection refused (os error 61), url: "+ws)
@@ -269,5 +307,37 @@ func TestDriftInstalledMagpie(t *testing.T) {
 	os.WriteFile(cfg, []byte("openai_base_url = \"http://127.0.0.1:9999"+gateway.CodexPath+"\"\nmodel = \"fake/m1\"\n"), 0o644)
 	if d := cx.Drift(); d == nil || d.Kind != "unwired" {
 		t.Fatalf("wired to neither: %+v", d)
+	}
+}
+
+// Whether the installed magpie wired the agent is looked up in the bytes
+// already read, not in a copy of the file and two strings of it: each
+// field's drift asked, 5 MB a poll of a Codex config.toml of 1.5 MB.
+func TestInstalledWiringReadsNoCopy(t *testing.T) {
+	t.Setenv("MAGPIE_ADDR", "127.0.0.1:3426")
+	home, _ := codexHome(t, "", "")
+	cx := codex(home)
+	var cfg strings.Builder
+	cfg.WriteString("openai_base_url = \"http://" + gateway.DefaultAddr + gateway.CodexPath + "\"\nmodel = \"fake/m1\"\n")
+	for i := range 20000 {
+		fmt.Fprintf(&cfg, "[projects.\"/Users/someone/work/project-%05d\"]\ntrust_level = \"trusted\"\n", i)
+	}
+	path := filepath.Join(home, ".codex", "config.toml")
+	if err := os.WriteFile(path, []byte(cfg.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	os.Chtimes(path, old, old)
+	if !cx.theInstalled() {
+		t.Fatal("the installed magpie's wiring not seen")
+	}
+	var m0, m1 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	for range 10 {
+		cx.theInstalled()
+	}
+	runtime.ReadMemStats(&m1)
+	if n := m1.TotalAlloc - m0.TotalAlloc; n > 1<<20 {
+		t.Fatalf("10 looks at an unchanged config allocated %d bytes", n)
 	}
 }

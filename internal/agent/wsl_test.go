@@ -182,9 +182,17 @@ func TestWSLAgentsElsewhere(t *testing.T) {
 // whose files were opened.
 func fakeWSL(t *testing.T, installed, running string, probes, roots map[string]string) (asked, opened *[]string) {
 	t.Helper()
+	// the fake stands in for wsl.exe, so there is WSL to look in: the
+	// stand-in and classifier paths of a request are gated on wslLooks
+	// (#4872) and must run here as they do on Windows
+	on := wslOn
+	wslOn = true
 	run, root := wslRun, wslRoot
-	reset := func() { wsl.seen, wsl.at, wsl.names, wsl.running, wsl.dirty = nil, time.Time{}, nil, nil, false }
-	t.Cleanup(func() { wslRun, wslRoot = run, root; reset() })
+	reset := func() {
+		wsl.seen, wsl.at, wsl.runAt, wsl.names, wsl.running, wsl.dirty = nil, time.Time{}, time.Time{}, nil, nil, false
+		wsl.runOK = false
+	}
+	t.Cleanup(func() { wslRun, wslRoot, wslOn = run, root, on; reset() })
 	reset()
 	asked, opened = &[]string{}, &[]string{}
 	wslRun = func(_ time.Duration, args ...string) ([]byte, error) {
@@ -193,6 +201,9 @@ func fakeWSL(t *testing.T, installed, running string, probes, roots map[string]s
 			return utf16le(installed, true), nil
 		case "-l --running -q":
 			return utf16le(running, true), nil
+		}
+		if len(args) > 4 && args[0] == "-d" && args[2] == "-e" && args[3] == "chmod" {
+			return nil, nil // a key store made owner-only after a write: not a start nor a probe
 		}
 		if len(args) > 2 && args[0] == "-d" {
 			*asked = append(*asked, args[1])
@@ -307,5 +318,116 @@ func TestWSLListFails(t *testing.T) {
 	}
 	if b2, _ := os.ReadFile(wslStatePath()); string(b2) != string(b) {
 		t.Fatalf("rewrote %s", b2)
+	}
+}
+
+// TJHHHH on Discord: magpie kept starting WSL while they repaired it. An
+// agent made while its distro ran is still read after the user stops it
+// (wsl --shutdown): its fields shown, the catalog synced, its check, the
+// requests it made. None of them opens the stopped distro, which would
+// start it: its fields read as last seen, and the next look neither probes
+// #2341: wsl.exe failing to say which distros run (a hung WSL times out
+// after 10s, under wsl's lock) is asked again only after
+// wslRunningFailedAge, not every wslRunningAge; an answer still lasts only
+// wslRunningAge.
+func TestWSLRunningFailedKept(t *testing.T) {
+	fakeWSL(t, "Ubuntu\r\n", "", nil, nil)
+	asks := 0
+	var err error
+	wslRun = func(_ time.Duration, args ...string) ([]byte, error) {
+		if strings.Join(args, " ") != "-l --running -q" {
+			t.Fatalf("wsl.exe %v", args)
+		}
+		asks++
+		return utf16le("Ubuntu\r\n", true), err
+	}
+	aged := func(d time.Duration) {
+		wsl.Lock()
+		wsl.runAt = time.Now().Add(-d)
+		wsl.Unlock()
+	}
+	err = errors.New("timed out")
+	if wslUp("Ubuntu") || asks != 1 {
+		t.Fatalf("failed: up, %d asks", asks)
+	}
+	aged(wslRunningAge + time.Second)
+	if wslUp("Ubuntu") || asks != 1 {
+		t.Fatalf("a failure was asked again after %v: %d asks", wslRunningAge, asks)
+	}
+	aged(wslRunningFailedAge + time.Second)
+	err = nil
+	if !wslUp("Ubuntu") || asks != 2 {
+		t.Fatalf("after %v: %d asks", wslRunningFailedAge, asks)
+	}
+	aged(wslRunningAge + time.Second)
+	wslUp("Ubuntu")
+	if asks != 3 {
+		t.Fatalf("an answer was kept past %v: %d asks", wslRunningAge, asks)
+	}
+}
+
+// nor opens it.
+func TestWSLStoppedSinceNotOpened(t *testing.T) {
+	codexHome(t, "", "")
+	root := t.TempDir()
+	cfg := filepath.Join(root, "home", "me", ".codex", "config.toml")
+	os.MkdirAll(filepath.Dir(cfg), 0o755)
+	os.WriteFile(cfg, []byte("model = \"gpt-5.5\"\n"), 0o644)
+	asked, opened := fakeWSL(t, "Ubuntu\r\n", "", map[string]string{"Ubuntu": "home:/home/me\ndir:.codex\n"}, map[string]string{"Ubuntu": root})
+	running, fake := "Ubuntu\r\n", wslRun
+	wslRun = func(d time.Duration, args ...string) ([]byte, error) {
+		if strings.Join(args, " ") == "-l --running -q" {
+			return utf16le(running, true), nil
+		}
+		return fake(d, args...)
+	}
+	as := wslAgentsOf(wslDistros())
+	if len(as) != 1 || as[0].ID != "codex@wsl:Ubuntu" {
+		t.Fatalf("%+v", as)
+	}
+	a := as[0]
+	if v := a.Values(); v["model"] != "gpt-5.5" {
+		t.Fatalf("running: %v", v)
+	}
+
+	running = ""
+	wsl.Lock()
+	wsl.runAt = time.Time{} // wslRunningAge later
+	wsl.Unlock()
+	// opening it would start it: here there is nothing to read, and a
+	// write would put the folder back
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	*asked, *opened = nil, nil
+	if v := a.Values(); v["model"] != "gpt-5.5" {
+		t.Fatalf("the stopped distro's files were read: %v", v)
+	}
+	if a.Sync != nil {
+		if err := a.Sync(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if a.Check != nil {
+		if c := a.Check(); c != "" {
+			t.Fatalf("check %q", c)
+		}
+	}
+	if a.Reached != nil {
+		if at, _, _ := a.Reached(time.Time{}); !at.IsZero() {
+			t.Fatal(at)
+		}
+	}
+	if ds := wslDistros(); len(ds) != 1 || ds[0].Running {
+		t.Fatalf("%+v", ds)
+	}
+	if WSLRunning("Ubuntu") {
+		t.Fatal("WSLRunning")
+	}
+	if len(*asked) != 0 || len(*opened) != 0 {
+		t.Fatalf("asked %v, opened %v", *asked, *opened)
+	}
+	if _, err := os.Stat(root); err == nil {
+		t.Fatal("written into the stopped distro")
 	}
 }

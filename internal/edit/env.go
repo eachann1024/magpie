@@ -11,16 +11,23 @@ var envLine = regexp.MustCompile(`^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=
 
 // GetEnvFile reads one key from a dotenv file.
 func GetEnvFile(path, key string) (string, bool) {
-	raw, err := Read(path)
+	raw, err := readHeld(path)
 	if err != nil {
 		return "", false
 	}
-	for _, l := range splitLines(string(raw)) {
-		if m := envLine.FindStringSubmatch(l); m != nil && m[1] == key {
+	// A key set twice takes its last value: dotenv readers, Gemini CLI's among
+	// them, let a later line override an earlier one.
+	lines := splitLines(string(raw))
+	for i := len(lines) - 1; i >= 0; i-- {
+		if m := envLine.FindStringSubmatch(lines[i]); m != nil && m[1] == key {
 			if v, ok := unquote(m[2]); ok {
 				return v, true
 			}
-			return m[2], true
+			v := m[2]
+			if i := strings.IndexByte(v, '#'); i >= 0 {
+				v = strings.TrimSpace(v[:i])
+			}
+			return v, true
 		}
 	}
 	return "", false
@@ -36,8 +43,13 @@ func SetEnvFile(path string, kvs ...KV) error {
 	lines := splitLines(string(raw))
 	for _, kv := range kvs {
 		v := toString(kv.Value)
-		if strings.ContainsAny(v, " #\"'$") {
-			v = `"` + strings.ReplaceAll(v, `"`, `\"`) + `"`
+		if strings.ContainsAny(v, " #\"'$\r\n") {
+			// Gemini CLI's dotenv keeps backslashes literal inside single quotes.
+			if !strings.ContainsAny(v, "'\r\n") {
+				v = "'" + v + "'"
+			} else {
+				v = `"` + strings.ReplaceAll(strings.ReplaceAll(v, `\`, `\\`), `"`, `\"`) + `"`
+			}
 		}
 		lines = setLine(lines, kv.Path, kv.Path+"="+v, nil, func(l string) (string, bool) {
 			if m := envLine.FindStringSubmatch(l); m != nil {
@@ -46,10 +58,12 @@ func SetEnvFile(path string, kvs ...KV) error {
 			return "", false
 		})
 	}
-	return WriteAtomic(path, []byte(joinLines(lines)))
+	lines = markEnv(lines, string(raw))
+	return WriteAtomic(path, []byte(joinLinesLike(lines, string(raw))))
 }
 
-// DelEnvFile removes keys from a dotenv file.
+// DelEnvFile removes keys from a dotenv file, and the file when they were
+// all it held (Gemini CLI's .env, made by magpie for its key).
 func DelEnvFile(path string, keys ...string) error {
 	raw, err := Read(path)
 	if err != nil || len(raw) == 0 {
@@ -70,6 +84,11 @@ func DelEnvFile(path string, keys ...string) error {
 	}
 	if !changed {
 		return nil
+	}
+	// a note magpie put above a key goes with it
+	out = markEnv(out, string(raw))
+	if strings.TrimSpace(strings.Join(withoutNotes(out), "")) == "" {
+		return Remove(path)
 	}
 	return WriteAtomic(path, []byte(joinLines(out)))
 }

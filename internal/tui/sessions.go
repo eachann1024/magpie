@@ -43,7 +43,11 @@ type sessFilterMsg struct {
 
 func (m *model) reloadSessions() {
 	m.sstats = sessions.StatsFor(sessRanges[m.srange].days)
-	m.slist = sessions.List(0)
+	// the whole set, as the page's count beside it is taken from: the list
+	// head says how many there are, and the range filter narrows what is
+	// shown of them. sessions.Limit is the window gateway attribution is
+	// judged over, not a listing's length, so this asks for sessions.All
+	m.slist = sessions.List(sessions.All)
 	m.ssel = clamp(m.ssel, len(m.sessShown()))
 }
 
@@ -51,6 +55,15 @@ func (m *model) reloadSessions() {
 // model and folder picked.
 func (m model) sessShown() []sessions.Session {
 	return sessFilter(m.slist, sessRanges[m.srange].days, m.smodel, m.sfolder, time.Now())
+}
+
+// sessNothing is what an empty range says: until the user allows an
+// agent (RustCats on X), magpie reads no agent's sessions, and says how.
+func sessNothing() string {
+	if !sessions.SettleReads().Asked {
+		return "magpie reads no agent's session history until you allow it · magpie sessions read on all (or on <agent>), or the app's Sessions page"
+	}
+	return "nothing in this range · Claude Code's, Codex's, OpenCode's and Pi's sessions on this computer show up here"
 }
 
 func sessFilter(all []sessions.Session, days int, model, folder string, now time.Time) []sessions.Session {
@@ -136,9 +149,10 @@ func resumeSession(s sessions.Session) tea.Cmd {
 	if fi, err := os.Stat(s.Cwd); s.Cwd != "" && (err != nil || !fi.IsDir()) {
 		return func() tea.Msg { return flashMsg{text: "its folder " + tildePath(s.Cwd) + " isn't there any more"} }
 	}
-	c := proc.Command("sh", "-c", s.Resume)
+	run := sessions.ResumeNow(s)
+	c := proc.Command("sh", "-c", run)
 	if runtime.GOOS == "windows" {
-		c = proc.Command("powershell", "-NoProfile", "-Command", s.Resume)
+		c = proc.Command("powershell", "-NoProfile", "-Command", run)
 	}
 	return tea.ExecProcess(c, func(err error) tea.Msg {
 		if err != nil {
@@ -226,7 +240,7 @@ func sessListLines(list []sessions.Session, agents []*agent.Agent, rng int, mode
 		if model != "" || folder != "" {
 			add(sMuted.Render("no session matches · x clears the filters"))
 		} else {
-			add(sMuted.Render("nothing in this range · Claude Code's, Codex's, OpenCode's and Pi's sessions on this computer show up here"))
+			add(sMuted.Render(sessNothing()))
 		}
 		return out
 	}
@@ -315,7 +329,7 @@ func sessLines(st sessions.Stats, rng int, model, folder string, byCost bool, wi
 		if model != "" || folder != "" {
 			add(sMuted.Render("no session matches · x clears the filters"))
 		} else {
-			add(sMuted.Render("nothing in this range · Claude Code's, Codex's, OpenCode's and Pi's sessions on this computer show up here"))
+			add(sMuted.Render(sessNothing()))
 		}
 		return out
 	}
@@ -324,7 +338,9 @@ func sessLines(st sessions.Stats, rng int, model, folder string, byCost bool, wi
 		c = sOK.Render(fmtCost(usage.Totals{Cost: r.Cost, Unpriced: len(r.Unpriced)}))
 	}
 	hit := ""
-	if p := r.Input + r.CacheRead; r.CacheRead > 0 && p > 0 {
+	// of all the prompts came to: Input leaves out what was read from the
+	// cache and what was written to it
+	if p := r.Input + r.CacheRead + r.CacheWrite; r.CacheRead > 0 && p > 0 {
 		hit = sMuted.Render(fmt.Sprintf(" (%d%% hit)", 100*r.CacheRead/p))
 	}
 	active := sessions.Duration(r.Active)

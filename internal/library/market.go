@@ -20,6 +20,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/iconproxy"
 )
 
 // The market is where the page finds MCP servers and skills to add in one
@@ -58,11 +61,19 @@ type MarketServer struct {
 	SignIn   bool `json:"signIn,omitempty"`
 	Featured bool `json:"featured,omitempty"`
 	// OptIn is one no agent is given unless it is picked for it
-	OptIn  bool    `json:"optIn,omitempty"`
-	Inputs []Input `json:"inputs"`
+	OptIn bool `json:"optIn,omitempty"`
+	// Unready is why one of magpie's own can't answer yet (nothing it
+	// needs is set up, or Settings turned it off), from the GUI, which
+	// knows: its tools still answer, with the same words
+	Unready string  `json:"unready,omitempty"`
+	Inputs  []Input `json:"inputs"`
 	// Have is the library's server that is this one
-	Have   string `json:"have,omitempty"`
+	Have string `json:"have,omitempty"`
+	// Match is one found at the address searched for: its repository, page,
+	// endpoint or package is it
+	Match  bool `json:"match,omitempty"`
 	server Server
+	addrs  []string // where it is, normalised (normAddr): matched by an address
 }
 
 func gh(owner string) string { return "https://github.com/" + owner + ".png?size=96" }
@@ -85,6 +96,9 @@ func secretEnv(key, label, where string) Input {
 // package is published, its endpoint answers.
 var featured = []MarketServer{
 	selfServer(),
+	browserServer(),
+	searchServer(),
+	visionServer(),
 	remoteServer("context7", "Context7", "Upstash", gh("upstash"), "https://mcp.context7.com/mcp",
 		"Up-to-date documentation and code examples for any library, straight into the prompt.", false,
 		Input{Key: "CONTEXT7_API_KEY", Where: "header", Label: "API key", Description: "Optional — raises the rate limit. From context7.com/dashboard", Secret: true, format: "{}"}),
@@ -99,6 +113,9 @@ var featured = []MarketServer{
 		"Ask questions about any public GitHub repository and read its generated wiki.", false),
 	remoteServer("exa", "Exa", "Exa", gh("exa-labs"), "https://mcp.exa.ai/mcp",
 		"Web search and code search built for agents, with clean page contents.", false),
+	remoteServer("anysearch", "AnySearch", "AnySearch", gh("anysearch-ai"), "https://api.anysearch.com/mcp",
+		"Real-time web search, vertical searches (finance, papers, code, security and more) and full pages as Markdown.", false,
+		Input{Key: "Authorization", Where: "header", Label: "API key", Description: "Optional — raises the rate limit. From anysearch.com/console/api-keys", Placeholder: "as_sk_…", Secret: true, format: "Bearer {}"}),
 	localServer("filesystem", "Filesystem", "Model Context Protocol", gh("modelcontextprotocol"), "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem",
 		"Read, write and search files, limited to the folders you allow.", "npx", []string{"-y", "@modelcontextprotocol/server-filesystem"},
 		Input{Key: "dir", Where: "arg", Label: "Folder", Description: "The folder it may read and write", Placeholder: "~/code", Required: true}),
@@ -146,16 +163,73 @@ var featured = []MarketServer{
 }
 
 // magpieCommand stands for this magpie's own binary in a featured server's
-// command, which InstallServer puts in when it is added.
+// command, which InstallServer puts in when it is added, and in a library
+// carried to another computer, which reads it as its own (self_here.go).
 const magpieCommand = "magpie"
+
+// selfServerName is the name magpie's own image generation server is written
+// under, in every agent's config.
+const selfServerName = "magpie-image"
 
 // selfServer is magpie's own image generation server: generate_image makes
 // an image with the model Settings → Images → Image generation names, saved
 // in the project. It costs what the model does, so it is given only to the
 // agents picked for it.
 func selfServer() MarketServer {
-	m := localServer("magpie-image", "Magpie Image", "Magpie", "https://usemagpie.ai/favicon.png", "https://usemagpie.ai",
-		"Generate and edit images with the image model set in Magpie (Settings → Images), saved in the project.", magpieCommand, []string{"mcp", "image"})
+	m := localServer(selfServerName, "Magpie Image", "Magpie", "https://usemagpie.ai/favicon.png", "https://usemagpie.ai",
+		"Generate and edit images with the image model set in Magpie (Settings → Images), and make short videos with a video model set up in Magpie (Grok Imagine, Seedance), saved in the project.", magpieCommand, []string{"mcp", "image"})
+	m.OptIn = true
+	return m
+}
+
+// browserServerName is the name Magpie Browser's server is written under.
+const browserServerName = "magpie-browser"
+
+// browserServer is Magpie Browser: the agent uses the user's own browser,
+// its tabs signed in to the sites they use, through the extension magpie
+// sets up (gateway/browser.go). It acts as the user wherever they are
+// signed in, so it is given only to the agents picked for it.
+func browserServer() MarketServer {
+	m := localServer(browserServerName, "Magpie Browser", "Magpie", "https://usemagpie.ai/favicon.png", "https://usemagpie.ai",
+		"Use your own browser: your tabs, signed in to the sites you use. Open pages, click, type, upload, read and take screenshots, through the Magpie Browser extension.", magpieCommand, []string{"mcp", "browser"})
+	m.OptIn = true
+	return m
+}
+
+// searchServerName is the name Magpie Web Search's server is written
+// under, the name the gateway's own search server goes by (ownMCP).
+const searchServerName = "magpie-web-search"
+
+// searchServer is Magpie Web Search: magpie's web search (Settings ›
+// Models › Web search) as a web_search and a web_fetch tool, through
+// `magpie mcp search`, which passes each call to the gateway's
+// SearchMCPPath. Settings named it, by its address only, and the Library
+// didn't have it (lutra_fs on Discord). A search costs what the searcher
+// or the search API it asks charges, and an agent mostly has a search of
+// its own, so it is given only to the agents picked for it.
+func searchServer() MarketServer {
+	m := localServer(searchServerName, "Magpie Web Search", "Magpie", "https://usemagpie.ai/favicon.png", "https://usemagpie.ai",
+		"Search the web with the search set in Magpie (Settings → Models → Web search), and read a page by its URL.", magpieCommand, []string{"mcp", "search"})
+	m.OptIn = true
+	return m
+}
+
+// visionServerName is the name Magpie Image Recognition's server is
+// written under, the name the gateway's own image recognition server goes
+// by (ownMCP).
+const visionServerName = "magpie-vision"
+
+// visionServer is Magpie Image Recognition: magpie's image recognition
+// (Settings › Models › Images › Image recognition) as an analyze_image
+// tool, through `magpie mcp vision`, which passes each call to the
+// gateway's VisionMCPPath. Settings named it by its address only, and the
+// Library had image generation and search but not it (matrix0487 on
+// Discord, #4653). A look costs what the model that sees charges, and
+// most agents' models see for themselves, so it is given only to the
+// agents picked for it.
+func visionServer() MarketServer {
+	m := localServer(visionServerName, "Magpie Image Recognition", "Magpie", "https://usemagpie.ai/favicon.png", "https://usemagpie.ai",
+		"Read an image (a file, a URL, a screenshot) with the image recognition model set in Magpie (Settings → Models → Images), for a model that can't see.", magpieCommand, []string{"mcp", "vision"})
 	m.OptIn = true
 	return m
 }
@@ -166,10 +240,7 @@ func selfCommand(s *Server) {
 	if s.Command != magpieCommand {
 		return
 	}
-	if exe, err := os.Executable(); err == nil {
-		if r, err := filepath.EvalSymlinks(exe); err == nil {
-			exe = r
-		}
+	if exe, err := selfExe(); err == nil {
 		s.Command = exe
 	}
 	if a := os.Getenv("MAGPIE_ADDR"); a != "" {
@@ -186,6 +257,7 @@ var homepages = map[string]string{
 	"github":          "https://github.com/github/github-mcp-server",
 	"deepwiki":        "https://deepwiki.com",
 	"exa":             "https://docs.exa.ai/reference/exa-mcp",
+	"anysearch":       "https://github.com/anysearch-ai/anysearch-mcp-server",
 	"sentry":          "https://docs.sentry.io/product/sentry-mcp/",
 	"linear":          "https://linear.app/docs/mcp",
 	"notion":          "https://developers.notion.com/docs/mcp",
@@ -208,11 +280,44 @@ func init() {
 		if m.Inputs == nil {
 			m.Inputs = []Input{}
 		}
+		m.addrs = addrsOf(m.Homepage, m.server.URL, packageOf(&m.server))
 	}
 }
 
 // registryURL is the MCP Registry's; a variable for tests.
 var registryURL = "https://registry.modelcontextprotocol.io/v0/servers"
+
+//go:embed market_servers.json
+var serversSnapshot []byte
+
+// popularServers are the registry's servers whose repositories have the
+// most stars on GitHub, most first, offered after the featured ones before
+// anything is searched. The registry lists tens of thousands, by name, so
+// they come from a crawl of it shipped with magpie (market_servers.json).
+// One a featured server already is, or two that start the same thing, is
+// offered once.
+var popularServers = sync.OnceValue(func() []MarketServer { return readPopular(serversSnapshot) })
+
+func readPopular(b []byte) []MarketServer {
+	var snap []registryServer
+	if json.Unmarshal(b, &snap) != nil {
+		return nil
+	}
+	out := []MarketServer{}
+	seen := map[string]bool{}
+	for _, m := range featured {
+		seen[serverKey(&m.server)] = true
+	}
+	for i := range snap {
+		m, ok := fromRegistry(&snap[i])
+		if !ok || seen[serverKey(&m.server)] {
+			continue
+		}
+		seen[serverKey(&m.server)] = true
+		out = append(out, m)
+	}
+	return out
+}
 
 // seenServers are the registry's servers the page was last shown, for one to
 // be installed by its id.
@@ -222,24 +327,55 @@ var seenServers = struct {
 }{m: map[string]MarketServer{}}
 
 // MarketServers is what the market shows for a search: the featured servers
-// that match it, then the registry's.
+// that match it, then the registry's, then the popular ones that do; with no
+// search, the featured and every popular one. A search that is an address —
+// a repository, a page, an endpoint, a package — finds the ones at it.
 func MarketServers(q string) ([]MarketServer, error) {
-	q = strings.ToLower(strings.TrimSpace(q))
+	raw := strings.TrimSpace(q)
+	q = strings.ToLower(raw)
+	addr := address(q)
 	var out []MarketServer
-	for _, m := range featured {
-		if q == "" || strings.Contains(strings.ToLower(m.Title+" "+m.ID+" "+m.Publisher+" "+m.Description), q) {
-			out = append(out, m)
-		}
-	}
-	var err error
-	if q != "" {
-		var found []MarketServer
-		found, err = searchRegistry(q)
-		for _, f := range found {
-			if !slices.ContainsFunc(out, func(m MarketServer) bool { return serverKey(&m.server) == serverKey(&f.server) }) {
+	seen := map[string]bool{}
+	add := func(list []MarketServer) {
+		for _, f := range list {
+			if k := serverKey(&f.server); !seen[k] {
+				seen[k] = true
 				out = append(out, f)
 			}
 		}
+	}
+	pick := func(list []MarketServer) []MarketServer {
+		var got []MarketServer
+		for _, m := range list {
+			switch {
+			case addr != "":
+				if addrScore(addr, m.addrs) > 0 {
+					m.Match = true
+					got = append(got, m)
+				}
+			case q == "" || strings.Contains(strings.ToLower(m.Title+" "+m.ID+" "+m.Publisher+" "+m.Description+" "+packageOf(&m.server)), q):
+				got = append(got, m)
+			}
+		}
+		return got
+	}
+	add(pick(featured))
+	var err error
+	switch {
+	case q == "":
+		add(popularServers())
+	case addr != "":
+		add(pick(popularServers()))
+		var found []MarketServer
+		found, err = searchAt(raw, addr)
+		add(found)
+	default:
+		// the registry's, ranked by name first; then the popular ones
+		// whose words have it
+		found, ferr := searchWords(q)
+		err = ferr
+		add(found)
+		add(pick(popularServers()))
 	}
 	if out == nil {
 		out = []MarketServer{}
@@ -258,8 +394,8 @@ func serverKey(s *Server) string {
 	if s.Remote() {
 		return strings.TrimSuffix(strings.ToLower(s.URL), "/")
 	}
-	if len(s.Args) == 2 && s.Args[0] == "mcp" && s.Args[1] == "image" {
-		return "magpie mcp image" // magpie's own, wherever its binary is
+	if len(s.Args) == 2 && s.Args[0] == "mcp" && (s.Args[1] == "image" || s.Args[1] == "browser" || s.Args[1] == "search" || s.Args[1] == "vision") {
+		return "magpie mcp " + s.Args[1] // magpie's own, wherever its binary is
 	}
 	for _, a := range s.Args {
 		if a == "" || strings.HasPrefix(a, "-") || a == "run" {
@@ -326,7 +462,16 @@ type registryVar struct {
 
 var placeholderRe = regexp.MustCompile(`\{[^{}]*\}`)
 
-func searchRegistry(q string) ([]MarketServer, error) {
+// listed is an active server the registry lists, as the market
+// offers it.
+type listed struct {
+	m MarketServer
+	r registryServer
+}
+
+// fetchRegistry is what the registry lists for a search, which it matches
+// against servers' names; the same server once.
+func fetchRegistry(q string) ([]listed, error) {
 	u := registryURL + "?" + url.Values{"search": {q}, "limit": {"100"}, "version": {"latest"}}.Encode()
 	var body struct {
 		Servers []struct {
@@ -336,14 +481,10 @@ func searchRegistry(q string) ([]MarketServer, error) {
 			} `json:"_meta"`
 		} `json:"servers"`
 	}
-	if err := getJSON(u, &body); err != nil {
-		return nil, fmt.Errorf("couldn't search the MCP Registry: %w", err)
+	if err := getJSONBy(registryClient, u, &body); err != nil {
+		return nil, &SearchError{Source: "the MCP Registry", Err: err}
 	}
-	type scored struct {
-		m     MarketServer
-		score int
-	}
-	var list []scored
+	var list []listed
 	seen := map[string]bool{}
 	for _, e := range body.Servers {
 		if st := e.Meta["io.modelcontextprotocol.registry/official"].Status; st != "" && st != "active" {
@@ -354,8 +495,68 @@ func searchRegistry(q string) ([]MarketServer, error) {
 			continue
 		}
 		seen[serverKey(&m.server)] = true
-		list = append(list, scored{m, rank(&e.Server, m, q)})
+		list = append(list, listed{m, e.Server})
 	}
+	return list, nil
+}
+
+type scored struct {
+	m     MarketServer
+	score int
+}
+
+func searchRegistry(q string) ([]MarketServer, error) {
+	found, err := fetchRegistry(q)
+	if err != nil {
+		return nil, err
+	}
+	var list []scored
+	for _, e := range found {
+		list = append(list, scored{e.m, rank(&e.r, e.m, q)})
+	}
+	return offer(list), nil
+}
+
+// searchRegistryAt finds the registry's servers at an address. The registry
+// searches names only, so it's asked for the names the address suggests (a
+// repository's, its owner's), and what it lists is kept when its repository,
+// page, endpoint or package is the address. When none is, what it lists for
+// the first name is offered, as a search for that name would.
+func searchRegistryAt(addr string) ([]MarketServer, error) {
+	var matched, byName []scored
+	seen := map[string]bool{}
+	for i, term := range addrTerms(addr) {
+		found, err := fetchRegistry(term)
+		if err != nil {
+			if i == 0 {
+				return nil, err
+			}
+			break
+		}
+		for _, e := range found {
+			if i == 0 {
+				byName = append(byName, scored{e.m, rank(&e.r, e.m, term)})
+			}
+			k := serverKey(&e.m.server)
+			if seen[k] {
+				continue
+			}
+			if sc := addrScore(addr, e.m.addrs); sc > 0 {
+				seen[k] = true
+				e.m.Match = true
+				matched = append(matched, scored{e.m, sc*1000 + rank(&e.r, e.m, term)})
+			}
+		}
+	}
+	if len(matched) > 0 {
+		return offer(matched), nil
+	}
+	return offer(byName), nil
+}
+
+// offer is the best of a search's servers, best first, kept for one to be
+// installed by its id.
+func offer(list []scored) []MarketServer {
 	sort.SliceStable(list, func(i, j int) bool { return list[i].score > list[j].score })
 	out := []MarketServer{}
 	seenServers.Lock()
@@ -364,13 +565,13 @@ func searchRegistry(q string) ([]MarketServer, error) {
 		clear(seenServers.m)
 	}
 	for i, s := range list {
-		if i == 30 {
+		if i == 100 {
 			break
 		}
 		seenServers.m[s.m.ID] = s.m
 		out = append(out, s.m)
 	}
-	return out, nil
+	return out
 }
 
 // rank puts first what's called what was searched for, then what says it
@@ -406,6 +607,13 @@ func rank(r *registryServer, m MarketServer, q string) int {
 // when it has one, else the package it's published as.
 func fromRegistry(r *registryServer) (MarketServer, bool) {
 	m := MarketServer{ID: r.Name, Name: shortName(r.Name), Title: r.Title, Description: r.Description, Homepage: r.WebsiteURL, Inputs: []Input{}}
+	m.addrs = addrsOf(r.Name, r.WebsiteURL, r.Repository.URL)
+	for _, rm := range r.Remotes {
+		m.addrs = append(m.addrs, addrsOf(rm.URL)...)
+	}
+	for _, p := range r.Packages {
+		m.addrs = append(m.addrs, addrsOf(p.Identifier)...)
+	}
 	if m.Title == "" {
 		m.Title = m.Name
 	}
@@ -559,6 +767,10 @@ func marketServer(id string) (MarketServer, bool) {
 	if i := slices.IndexFunc(featured, func(m MarketServer) bool { return m.ID == id }); i >= 0 {
 		return featured[i], true
 	}
+	list := popularServers()
+	if i := slices.IndexFunc(list, func(m MarketServer) bool { return m.ID == id }); i >= 0 {
+		return list[i], true
+	}
 	seenServers.Lock()
 	defer seenServers.Unlock()
 	m, ok := seenServers.m[id]
@@ -659,6 +871,37 @@ func serverIcon(l *Library, s *Server) string {
 	return ""
 }
 
+// serverAbout is what a server is for, where the market says: the
+// featured or registry server it is, or the featured one it is named
+// after; "" for the rest.
+func serverAbout(s *Server) string {
+	k := serverKey(s)
+	for _, m := range featured {
+		if serverKey(&m.server) == k {
+			return m.Description
+		}
+	}
+	for _, m := range popularServers() {
+		if serverKey(&m.server) == k {
+			return m.Description
+		}
+	}
+	seenServers.Lock()
+	for _, m := range seenServers.m {
+		if serverKey(&m.server) == k {
+			seenServers.Unlock()
+			return m.Description
+		}
+	}
+	seenServers.Unlock()
+	for _, m := range featured {
+		if strings.EqualFold(m.ID, s.Name) {
+			return m.Description
+		}
+	}
+	return ""
+}
+
 // skillIcon is its repository owner's avatar, for a skill from GitHub.
 func skillIcon(s *Skill) string {
 	if s.Source == nil || s.Source.Kind != "github" {
@@ -681,11 +924,26 @@ type MarketSkill struct {
 	Name     string `json:"name"`
 	Installs int    `json:"installs"`
 	Official bool   `json:"official,omitempty"`
+	// Featured is magpie's own, not one skills.sh lists
+	Featured bool   `json:"featured,omitempty"`
 	Icon     string `json:"icon"`
 	// Description is known once it has been fetched
 	Description string `json:"description,omitempty"`
 	Have        string `json:"have,omitempty"`
 }
+
+// featuredSkills are magpie's own skills, first in the market: in
+// magpie-community/plugins, beside its plugins. magpie-setup has an agent
+// set magpie up as the user asks, through its commands (Leyuu_5 on X: so
+// many features that an AI could do the setting up); magpie-quota reads
+// what magpie quota tells (ttmouse on X).
+var featuredSkills = []MarketSkill{{
+	Source: "magpie-community/plugins", SkillID: "magpie-setup", Name: "magpie-setup", Official: true, Featured: true,
+	Description: "Set magpie up as you ask, through its own commands: add keys and subscriptions, point agents at models, build routing groups with fallbacks and time-of-day rules, give devices gateway keys with budgets, and share MCP servers and instructions with every agent.",
+}, {
+	Source: "magpie-community/plugins", SkillID: "magpie-quota", Name: "magpie-quota", Official: true, Featured: true,
+	Description: "Check how much is left of the user's AI subscriptions, coding plans and API key balances through magpie: each usage window's percent used and when it resets, each key's balance, and wait until a subscription has allowance again.",
+}}
 
 type skillsShEntry struct {
 	Source   string `json:"source"`
@@ -710,16 +968,16 @@ var popular = struct {
 }{}
 
 func marketCache(name string) string {
-	d, err := os.UserCacheDir()
+	d, err := appdir.SystemCache()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(d, "magpie", "market", name)
+	return filepath.Join(d, "market", name)
 }
 
 // popularSkills are skills.sh's most installed, read off its front page,
-// which lists them for itself; kept for six hours, and on disk for when
-// it can't be reached, else what magpie shipped with.
+// then the ones trending there that aren't among them; kept for six hours,
+// and on disk for when it can't be reached, else what magpie shipped with.
 func popularSkills() []skillsShEntry {
 	popular.Lock()
 	defer popular.Unlock()
@@ -743,8 +1001,33 @@ func popularSkills() []skillsShEntry {
 	return list
 }
 
+// fetchPopular is skills.sh's front page's list, its 600 most installed,
+// then its trending page's that aren't on it. A trending skill's count is
+// of its recent installs, not all of them, so it isn't told.
 func fetchPopular() ([]skillsShEntry, error) {
-	b, err := get(skillsShURL+"/", "text/html", 8<<20)
+	list, err := skillsShList("/")
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	for _, e := range list {
+		seen[e.Source+"/"+e.SkillID] = true
+	}
+	if more, err := skillsShList("/trending"); err == nil {
+		for _, e := range more {
+			if !seen[e.Source+"/"+e.SkillID] {
+				seen[e.Source+"/"+e.SkillID] = true
+				e.Installs = 0
+				list = append(list, e)
+			}
+		}
+	}
+	return list, nil
+}
+
+// skillsShList is the list of skills a skills.sh page has in its data.
+func skillsShList(path string) ([]skillsShEntry, error) {
+	b, err := get(skillsShURL+path, "text/html", 8<<20)
 	if err != nil {
 		return nil, err
 	}
@@ -766,14 +1049,15 @@ func searchSkillsSh(q string) ([]skillsShEntry, error) {
 	var body struct {
 		Skills []skillsShEntry `json:"skills"`
 	}
-	if err := getJSON(skillsShURL+"/api/search?"+url.Values{"q": {q}, "limit": {"40"}}.Encode(), &body); err != nil {
-		return nil, fmt.Errorf("couldn't search skills.sh: %w", err)
+	if err := getJSON(skillsShURL+"/api/search?"+url.Values{"q": {q}, "limit": {"200"}}.Encode(), &body); err != nil {
+		return nil, &SearchError{Source: "skills.sh", Err: err}
 	}
 	return slices.DeleteFunc(body.Skills, func(e skillsShEntry) bool { return !repoRe.MatchString(e.Source) || e.SkillID == "" }), nil
 }
 
-// MarketSkills is what the market shows for a search: the most installed
-// skills that match it, then what skills.sh finds for it.
+// MarketSkills is what the market shows for a search: magpie's own skills
+// that match it, the most installed skills that do, then what skills.sh
+// finds for it.
 func MarketSkills(q string) ([]MarketSkill, error) {
 	q = strings.ToLower(strings.TrimSpace(q))
 	var list []skillsShEntry
@@ -784,10 +1068,7 @@ func MarketSkills(q string) ([]MarketSkill, error) {
 		}
 	}
 	if q == "" {
-		// a few each from the repositories with the most, for the first page
-		// not to be one author's
-		per := map[string]int{}
-		list = slices.DeleteFunc(list, func(e skillsShEntry) bool { per[e.Source]++; return per[e.Source] > 4 })
+		list = byRepo(list)
 	}
 	if len(q) >= 2 {
 		var found []skillsShEntry
@@ -798,12 +1079,29 @@ func MarketSkills(q string) ([]MarketSkill, error) {
 			}
 		}
 	}
-	if len(list) > 60 {
-		list = list[:60]
-	}
 	about := cachedAbout()
 	l, _ := loadLocked()
 	out := []MarketSkill{}
+	for _, f := range featuredSkills {
+		if q != "" && !strings.Contains(strings.ToLower(f.Name+" "+f.Source+" "+f.Description), q) {
+			continue
+		}
+		owner, _, _ := strings.Cut(f.Source, "/")
+		f.ID, f.Icon = f.Source+"/"+f.SkillID, gh(owner)
+		if l != nil {
+			f.Have = l.haveSkill(f.Source, f.SkillID, f.Name)
+		}
+		// once skills.sh lists it too, its count of installs is told, and
+		// it isn't shown twice
+		list = slices.DeleteFunc(list, func(e skillsShEntry) bool {
+			if e.Source == f.Source && e.SkillID == f.SkillID {
+				f.Installs = e.Installs
+				return true
+			}
+			return false
+		})
+		out = append(out, f)
+	}
 	for _, e := range list {
 		owner, _, _ := strings.Cut(e.Source, "/")
 		ms := MarketSkill{ID: e.Source + "/" + e.SkillID, Source: e.Source, SkillID: e.SkillID, Name: e.Name, Installs: e.Installs,
@@ -817,10 +1115,37 @@ func MarketSkills(q string) ([]MarketSkill, error) {
 	return out, err
 }
 
+// byRepo is the most installed of each repository first, then each one's
+// second, and so on, for the first page not to be one author's; all of
+// them are there for the reader to go on to.
+func byRepo(list []skillsShEntry) []skillsShEntry {
+	nth := map[string]int{}
+	rounds := [][]skillsShEntry{}
+	for _, e := range list {
+		n := nth[e.Source]
+		nth[e.Source]++
+		if n == len(rounds) {
+			rounds = append(rounds, nil)
+		}
+		rounds[n] = append(rounds[n], e)
+	}
+	return slices.Concat(rounds...)
+}
+
 func (l *Library) haveSkill(source, id, name string) string {
 	for _, s := range l.Skills {
 		if s.Source != nil && s.Source.Kind == "github" && strings.EqualFold(s.Source.Repo, source) &&
 			(s.Name == id || s.Name == name || lastPart(s.Source.Path) == id) {
+			return s.Name
+		}
+	}
+	// one taken in from an agent's folder (npx skills puts them in
+	// ~/.agents/skills) has no repository to match: it's had by its name,
+	// unless it is known to come from another repository. One by that name
+	// from another repository is another skill, added beside it
+	// (skill_beside.go)
+	for _, n := range []string{id, name} {
+		if s := l.skill(n); s != nil && (s.Source == nil || s.Source.Kind == "folder") && (s.From == "" || strings.EqualFold(s.From, source)) {
 			return s.Name
 		}
 	}
@@ -905,7 +1230,9 @@ func InstallMarketSkill(source, id string, agents []string) (*Result, error) {
 	if !repoRe.MatchString(source) {
 		return nil, fmt.Errorf("%s isn't a GitHub repository", source)
 	}
-	p, err := cachedProbe(source)
+	// only this skill's folder, when the repository is too big to
+	// download whole (#2794)
+	p, err := cachedProbeFor(source, id)
 	if err != nil {
 		return nil, err
 	}
@@ -916,9 +1243,6 @@ func InstallMarketSkill(source, id string, agents []string) (*Result, error) {
 	if i < 0 {
 		return nil, fmt.Errorf("%s has no skill %s any more", source, id)
 	}
-	if p.Candidates[i].Have {
-		return nil, fmt.Errorf("the library already has a skill called %s", p.Candidates[i].Name)
-	}
 	if agents == nil {
 		for _, t := range Targets() {
 			if t.Skills != "" {
@@ -926,7 +1250,10 @@ func InstallMarketSkill(source, id string, agents []string) (*Result, error) {
 			}
 		}
 	}
-	return InstallSkills(source, []string{p.Candidates[i].Path}, agents)
+	// the market showed this one skill: the repository's others are
+	// offered as new by a check, beside it
+	path := p.Candidates[i].Path
+	return installChange(func(l *Library, in *installed) error { return installFrom(l, p, []string{path}, agents, false, in) })
 }
 
 // ---- icons ------------------------------------------------------------------
@@ -961,7 +1288,7 @@ func offered(u string) bool {
 	if !strings.HasPrefix(u, "https://") {
 		return false
 	}
-	if slices.ContainsFunc(featured, func(m MarketServer) bool { return m.Icon == u }) {
+	if slices.ContainsFunc(featured, func(m MarketServer) bool { return m.Icon == u }) || slices.ContainsFunc(popularServers(), func(m MarketServer) bool { return m.Icon == u }) {
 		return true
 	}
 	if rest, ok := strings.CutPrefix(u, "https://github.com/"); ok && strings.HasSuffix(rest, ".png?size=96") && !strings.Contains(strings.TrimSuffix(rest, ".png?size=96"), "/") {
@@ -980,8 +1307,10 @@ func offered(u string) bool {
 	return false
 }
 
+// fetchImage downloads an icon through usemagpie.ai's icon proxy, so the
+// host a server's author picked never sees the user's IP.
 func fetchImage(u string) ([]byte, string, error) {
-	b, err := get(u, "image/*", 1<<20)
+	b, err := get(iconproxy.URL(u), "image/*", 1<<20)
 	if err != nil {
 		return nil, "", err
 	}
@@ -999,6 +1328,31 @@ func fetchImage(u string) ([]byte, string, error) {
 
 var client = &http.Client{Timeout: 20 * time.Second}
 
+// registryTimeout is the MCP Registry's own budget: its search answers in
+// 13-37 s often enough (9 of 33 tries past 13 s, 6 past 20 s, the slowest
+// 37.3 s - measured in #3043) that the market's 20 s client emptied the
+// search with "context deadline exceeded". Its asks go with a longer one;
+// skills.sh and the icons keep the short one.
+var registryTimeout = 60 * time.Second
+
+// registryClient is the client the registry is asked with, a variable for
+// tests.
+var registryClient = &http.Client{Timeout: registryTimeout}
+
+// SearchError is a source the market searches that didn't answer; what
+// the market has of its own is still listed beside it (#1589).
+type SearchError struct {
+	Source string // skills.sh, the MCP Registry
+	Err    error
+}
+
+func (e *SearchError) Error() string { return "couldn't search " + e.Source + ": " + e.Err.Error() }
+func (e *SearchError) Unwrap() error { return e.Err }
+
+// retryPause is how long a 503 is waited out before the one more try; a
+// variable for tests.
+var retryPause = time.Second
+
 var metaDescRe = regexp.MustCompile(`<meta\s+name="description"\s+content="([^"]*)"`)
 
 // metaDescription is what a page's <meta name="description"> says.
@@ -1011,6 +1365,11 @@ func metaDescription(page []byte) string {
 }
 
 func get(u, accept string, limit int64) ([]byte, error) {
+	return getBy(client, u, accept, limit)
+}
+
+// getBy is get with the client: the registry's own budget (#3043).
+func getBy(c *http.Client, u, accept string, limit int64) ([]byte, error) {
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return nil, err
@@ -1018,9 +1377,18 @@ func get(u, accept string, limit int64) ([]byte, error) {
 	// skills.sh answers a client it doesn't know with a page of its own
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 magpie")
 	req.Header.Set("Accept", accept)
-	resp, err := client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
+	}
+	// a 503 is a server starting cold or busy for a moment (skills.sh's
+	// search answered one, and 200 right after, #1589): it's asked once more
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		resp.Body.Close()
+		time.Sleep(retryPause)
+		if resp, err = c.Do(req); err != nil {
+			return nil, err
+		}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
@@ -1038,6 +1406,15 @@ func get(u, accept string, limit int64) ([]byte, error) {
 
 func getJSON(u string, v any) error {
 	b, err := get(u, "application/json", 8<<20)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, v)
+}
+
+// getJSONBy is getJSON with the client (the registry's own budget, #3043).
+func getJSONBy(c *http.Client, u string, v any) error {
+	b, err := getBy(c, u, "application/json", 8<<20)
 	if err != nil {
 		return err
 	}
