@@ -1620,10 +1620,24 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 			rows, ids := slices.Clip(shown), map[int]string{}
 			if !magpie && provider.BareModelIDs() {
 				labels = slices.Clip(labels)
-				for _, b := range provider.BareEntries(shown) {
-					ids[len(rows)] = b.ID
-					rows = append(rows, shown[b.Of])
-					labels = append(labels, labels[b.Of])
+				if provider.OnlyBare() {
+					// the bare ids alone: a clash keeps its provider/model
+					// id, and the long id is still accepted, just not listed
+					listed, _ := provider.OnlyBareList(shown, labels)
+					rows, labels = nil, nil
+					for _, row := range listed {
+						if row.ID != row.Entry.ID {
+							ids[len(rows)] = row.ID
+						}
+						rows = append(rows, row.Entry)
+						labels = append(labels, row.Label)
+					}
+				} else {
+					for _, b := range provider.BareEntries(shown) {
+						ids[len(rows)] = b.ID
+						rows = append(rows, shown[b.Of])
+						labels = append(labels, labels[b.Of])
+					}
 				}
 			}
 			for i, e := range rows {

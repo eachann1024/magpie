@@ -3,6 +3,7 @@ package provider
 import (
 	"strings"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -26,16 +27,55 @@ import (
 // BareModelIDs says whether /v1/models lists models by their bare ids too.
 func BareModelIDs() bool { return settings.Load().BareModelIDs }
 
+// onlyBareSet is the OnlyBareModelIDs choice, on when the settings file
+// leaves it out.
+func onlyBareSet(s settings.Settings) bool {
+	return s.OnlyBareModelIDs == nil || *s.OnlyBareModelIDs
+}
+
+// OnlyBare says whether the bare ids replace the provider/model ids in
+// /v1/models and in Pi's models.json, rather than being added after them.
+// Off while BareModelIDs is off: there are no bare ids to keep alone.
+func OnlyBare() bool {
+	s := settings.Load()
+	return s.BareModelIDs && onlyBareSet(s)
+}
+
 // SetBareModelIDs turns settings.BareModelIDs on or off. The list is built
 // for each request, so the next one has the bare ids, or goes without
-// them; no agent's file names a model by one, so none is written again.
+// them. Pi's file names a model by the bare id while OnlyBare is on, so
+// that file is written again then.
 func SetBareModelIDs(on bool) error {
 	s := settings.Load()
 	if s.BareModelIDs == on {
 		return nil
 	}
 	s.BareModelIDs = on
-	return settings.Save(s)
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	if onlyBareSet(s) {
+		catalog.Touched()
+	}
+	return nil
+}
+
+// SetOnlyBareModelIDs turns settings.OnlyBareModelIDs on or off. On, the
+// lists that grow bare ids publish those alone. Pi is told when the
+// choice changes while bare ids are listed.
+func SetOnlyBareModelIDs(on bool) error {
+	s := settings.Load()
+	if s.OnlyBareModelIDs != nil && *s.OnlyBareModelIDs == on {
+		return nil
+	}
+	s.OnlyBareModelIDs = &on
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	if s.BareModelIDs {
+		catalog.Touched()
+	}
+	return nil
 }
 
 // Bare is a row a list adds for a bare id: ID, and Of, the index in the
@@ -107,4 +147,52 @@ func BareEntry(shown []Entry, id string) (Entry, bool) {
 		}
 	}
 	return Entry{}, false
+}
+
+// BareRow is one model as a list publishes it when only the bare ids are
+// listed: Entry is the model a request for ID reaches, ID the id to
+// publish (the bare id, or Entry.ID where the bare id is not listed).
+type BareRow struct {
+	Entry Entry
+	ID    string
+	Label string
+}
+
+// OnlyBareList is shown published by bare id alone. Each id BareEntries
+// would add is one row, the entry a request for it reaches, and its label.
+// An entry folded into that id is left out. An entry BareEntries does not
+// cover — the bare id is already a catalog id, or a request for it would
+// not reach a model the list shows — stays, under its own id, so a clash
+// keeps the provider in front. from maps each catalog id in shown to the
+// id published for it.
+func OnlyBareList(shown []Entry, labels []string) (rows []BareRow, from map[string]string) {
+	if len(labels) != len(shown) {
+		labels = Labels(shown)
+	}
+	bares := BareEntries(shown)
+	covered := map[string]bool{}
+	for _, b := range bares {
+		covered[b.ID] = true
+	}
+	from = make(map[string]string, len(shown))
+	pointed := map[int]bool{}
+	for _, b := range bares {
+		pointed[b.Of] = true
+		rows = append(rows, BareRow{Entry: shown[b.Of], ID: b.ID, Label: labels[b.Of]})
+		from[shown[b.Of].ID] = b.ID
+	}
+	for i, e := range shown {
+		if pointed[i] {
+			continue
+		}
+		if e.Group == "" && e.Model != "" && covered[e.Model] {
+			from[e.ID] = e.Model
+			continue
+		}
+		rows = append(rows, BareRow{Entry: e, ID: e.ID, Label: labels[i]})
+		if _, ok := from[e.ID]; !ok {
+			from[e.ID] = e.ID
+		}
+	}
+	return rows, from
 }

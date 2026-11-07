@@ -82,6 +82,14 @@ function renderBareIds(s) {
   $("#bareIdsSegs").replaceChildren(segs([[false, t("Off")], [true, t("On")]], !!s.bareModelIDs, (on) =>
     writingPrefs(api("settings/bare-ids", { on })).then((ns) => { prefs = state.settings = ns; renderSettings(); })
       .catch((e) => { status(t(e.message), "err"); renderSettings(); })));
+  // Only the short ids: shown while the row above is on, and on unless
+  // the settings file says false (this tree lists the short ids alone)
+  const row = $("#onlyBareRow");
+  row.hidden = !s.bareModelIDs;
+  if (row.hidden) return;
+  $("#onlyBareSegs").replaceChildren(segs([[false, t("Off")], [true, t("On")]], s.onlyBareModelIDs !== false, (on) =>
+    writingPrefs(api("settings/only-bare-ids", { on })).then((ns) => { prefs = state.settings = ns; renderSettings(); })
+      .catch((e) => { status(t(e.message), "err"); renderSettings(); })));
 }
 
 // renderBusyLoad: the load past which a model its plugin says is busy

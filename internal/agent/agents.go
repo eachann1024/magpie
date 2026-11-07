@@ -1510,7 +1510,15 @@ func piLikeKeyed(at place, id, name, dir string, key func() string) *Agent {
 			}
 			// an entry on a model magpie no longer gives Pi names nothing
 			// (#2055, scope_gone.go)
-			return piScopeSynced(path, modelsPath, gone)
+			if err := piScopeSynced(path, modelsPath, gone); err != nil {
+				return err
+			}
+			// Pi's own file, not a fork's: the saved model follows the
+			// bare id the provider block now writes
+			if id == "pi" {
+				return piRewriteBare(path, id)
+			}
+			return nil
 		},
 		// a provider renamed takes its magpie/<id>/ entries in enabledModels
 		// with it: an entry left on the old id names nothing, and Pi would

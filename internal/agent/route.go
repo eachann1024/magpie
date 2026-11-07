@@ -339,6 +339,21 @@ func buildModels(agent string) []catalog.Model {
 	var out []catalog.Model
 	shown, _ := provider.CatalogFor(agent)
 	labels := provider.Labels(shown)
+	// Pi's models.json names a model by the bare id when that is all the
+	// gateway lists, so its picker does not show provider/model twice.
+	// The entry stays the one a request for that id reaches.
+	bareID := map[int]string{}
+	if agent == "pi" && provider.OnlyBare() {
+		listed, _ := provider.OnlyBareList(shown, labels)
+		shown, labels = nil, nil
+		for _, row := range listed {
+			if row.ID != row.Entry.ID {
+				bareID[len(shown)] = row.ID
+			}
+			shown = append(shown, row.Entry)
+			labels = append(labels, row.Label)
+		}
+	}
 	// a model magpie describes images to takes them (provider.Described)
 	seen := describedNow()
 	// the agent's own Long conversations, if it has one (ForAgent)
@@ -355,7 +370,11 @@ func buildModels(agent string) []catalog.Model {
 			// word on included (provider.CodexEfforts)
 			efforts = provider.CodexEfforts(e)
 		}
-		m := catalog.Model{ID: e.ID, Name: labels[i], Provider: firstOf(e.Provider.Catalogs()), Efforts: efforts, Images: e.Images || seen, ImageInput: e.ImageInput, Context: e.Context, Output: e.Output, OutputSet: e.OutputSet, AgentsV2: e.AgentsV2, Reasoning: e.Thinks(),
+		id := e.ID
+		if bare, ok := bareID[i]; ok {
+			id = bare
+		}
+		m := catalog.Model{ID: id, Name: labels[i], Provider: firstOf(e.Provider.Catalogs()), Efforts: efforts, Images: e.Images || seen, ImageInput: e.ImageInput, Context: e.Context, Output: e.Output, OutputSet: e.OutputSet, AgentsV2: e.AgentsV2, Reasoning: e.Thinks(),
 			AlwaysThinks: e.AlwaysThinks, DynamicTools: e.DynamicTools, DefaultEffort: e.DefaultEffort}
 		// where Codex and Claude Code compact it (#876): a threshold the
 		// user set on the model or on its provider, else a window they

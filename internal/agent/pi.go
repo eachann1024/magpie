@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // Pi's enabledModels (settings.json) is its Ctrl+P cycle and /scoped-models
@@ -88,6 +89,58 @@ func piScopeWithout(settings string) error {
 		return edit.DelJSON(settings, "enabledModels")
 	}
 	return edit.SetJSON(settings, edit.KV{Path: "enabledModels", Value: kept})
+}
+
+// piRewriteBare points Pi's saved model at the bare id models.json now
+// writes, when only those ids are listed. defaultModel is the catalog id;
+// an enabledModels entry is magpie/<id>, with a thinking level after it
+// or not. A name the list still publishes as it was is left alone.
+func piRewriteBare(settings, agentID string) error {
+	if !provider.OnlyBare() {
+		return nil
+	}
+	shown, _ := provider.CatalogFor(agentID)
+	_, from := provider.OnlyBareList(shown, nil)
+	var kvs []edit.KV
+	if cur, ok := edit.GetJSON(settings, "defaultModel"); ok {
+		if next, ok := piBareRef(cur, from); ok {
+			kvs = append(kvs, edit.KV{Path: "defaultModel", Value: next})
+		}
+	}
+	pats := piScope(settings)
+	if pats != nil {
+		next, changed := slices.Clone(pats), false
+		for i, p := range next {
+			if n, ok := piBareRef(p, from); ok {
+				next[i], changed = n, true
+			}
+		}
+		if changed {
+			kvs = append(kvs, edit.KV{Path: "enabledModels", Value: next})
+		}
+	}
+	if len(kvs) == 0 {
+		return nil
+	}
+	return edit.SetJSON(settings, kvs...)
+}
+
+// piBareRef is ref with its model id published as from says. ref is a
+// catalog id, or magpie/ plus one, and either may end in a thinking level.
+func piBareRef(ref string, from map[string]string) (string, bool) {
+	prefix, rest := "", ref
+	if p, ok := strings.CutPrefix(rest, magpieID+"/"); ok {
+		prefix, rest = magpieID+"/", p
+	}
+	level := ""
+	if i := strings.LastIndex(rest, ":"); i > 0 && slices.Contains(piLevels, rest[i+1:]) {
+		level, rest = rest[i:], rest[:i]
+	}
+	next, ok := from[rest]
+	if !ok || next == rest {
+		return ref, false
+	}
+	return prefix + next + level, true
 }
 
 // piStartup is the model a new Pi session starts on, as the model field

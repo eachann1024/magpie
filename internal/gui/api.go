@@ -1622,6 +1622,20 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		}
 		writeJSON(rw, settingsState())
 	})
+	// whether those bare ids are the only ones listed and written for Pi
+	// (settings.OnlyBareModelIDs). Absent in the file is on.
+	mux.HandleFunc("POST /api/settings/only-bare-ids", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ On bool }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		if err := provider.SetOnlyBareModelIDs(in.On); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
 	// the load over which a model its plugin says is busy goes behind
 	// the others (settings.BusyLoad, axelburks on Discord): 0 for off
 	mux.HandleFunc("POST /api/settings/busy-load", func(rw http.ResponseWriter, r *http.Request) {

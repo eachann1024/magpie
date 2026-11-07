@@ -672,6 +672,12 @@ type Settings struct {
 	// "codex/gpt-5.6-sol"), for clients moved from another proxy that ask
 	// for bare ids (love1sbug on X; provider.BareEntries). Off by default.
 	BareModelIDs bool `json:"bareModelIDs,omitempty"`
+	// OnlyBareModelIDs, with BareModelIDs, lists and writes only those
+	// bare ids: the long provider/model id stays accepted, and is kept in
+	// the list only where the bare id would clash or would not route to
+	// the model shown (provider.OnlyBareList). Nil is on, this tree's
+	// default; false puts the long ids back beside the bare ones.
+	OnlyBareModelIDs *bool `json:"onlyBareModelIDs,omitempty"`
 	// CodexAgentsV1 has the OpenAI models magpie hands Codex — the ChatGPT
 	// account's own, their codex/ ids and the groups one is in — say
 	// multi_agent_version "v1" (#141): their subagents are then handed

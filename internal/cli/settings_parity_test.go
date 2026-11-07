@@ -192,6 +192,7 @@ var notYet = map[string]string{
 	"POST /api/set":                              S2, // api.go
 	"POST /api/settings/allowips":                S2, // api.go
 	"POST /api/settings/bare-ids":                S2, // api.go
+	"POST /api/settings/only-bare-ids":           S2, // api.go
 	"POST /api/settings/busy-load":               S2, // api.go
 	"POST /api/settings/checkin-account":         S2, // api.go
 	"POST /api/settings/claude-cache":            S2, // tune.go
